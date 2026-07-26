@@ -185,10 +185,25 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
 
     conn = db.connect()
     placeholders = ",".join("?" for _ in target_types)
+
+    # Отложенные письма: фактов оказалось меньше минимума. В список они не
+    # идут, но и молча пропасть не должны — показываем именами в хвосте.
+    thin_rows = conn.execute(
+        f"""
+        SELECT inn, name, site_url, letter_facts FROM companies
+        WHERE letter_status = 'thin'
+          AND site_type IN ({placeholders})
+          AND last_reported IS NULL
+        ORDER BY name
+        """,
+        tuple(target_types),
+    ).fetchall()
+
     rows = conn.execute(
         f"""
         SELECT * FROM companies
         WHERE letter_body IS NOT NULL
+          AND COALESCE(letter_status, 'ok') = 'ok'
           AND site_type IN ({placeholders})
           AND last_reported IS NULL
         ORDER BY
@@ -203,8 +218,14 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
     ).fetchall()
 
     if not rows:
-        logger.warning("Нет компаний с готовыми письмами. "
-                       "Порядок: --stage targets, --stage dossier, --stage compose")
+        if thin_rows:
+            logger.warning(
+                "Годных писем нет, отложено из-за нехватки фактов: %d. "
+                "Смотреть: sqlite3 data/leads.db < tools/thin.sql", len(thin_rows)
+            )
+        else:
+            logger.warning("Нет компаний с готовыми письмами. "
+                           "Порядок: --stage targets, --stage dossier, --stage compose")
         conn.close()
         return None
 
@@ -222,15 +243,12 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
     ]
 
     for index, row in enumerate(rows, start=1):
-        thin = False
         try:
             facts = json.loads(row["letter_facts"] or "[]")
-            thin = len(facts) < 2
         except (json.JSONDecodeError, TypeError):
             facts = []
 
-        marker = "⚠️" if thin else "•"
-        lines.append(f"## {index}. {marker} {row['name']}")
+        lines.append(f"## {index}. {row['name']}")
         lines.append("")
         lines.append(f"**Почему здесь:** {row['letter_why'] or '—'}")
         lines.append("")
@@ -268,15 +286,31 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
         lines.append("```")
         lines.append("")
 
-        if thin:
-            lines.append("> ⚠️ Письмо опирается меньше чем на два факта из досье — "
-                         "вероятно, получилось шаблонным. Проверьте особенно внимательно.")
-            lines.append("")
-        elif facts:
+        if facts:
             lines.append(f"<sub>Факты в письме: {'; '.join(facts)}</sub>")
             lines.append("")
 
         lines.append("---")
+        lines.append("")
+
+    if thin_rows:
+        lines.append("## Отложено: не на чем построить письмо")
+        lines.append("")
+        lines.append(
+            "По этим компаниям письмо получилось бы общим — фактов с сайта "
+            "набралось меньше минимума. Письмо, которое говорит «вас нашла "
+            "система», и при этом подходит кому угодно, вредит больше, "
+            "чем неотправленное."
+        )
+        lines.append("")
+        for row in thin_rows:
+            site = f" — {row['site_url']}" if row["site_url"] else ""
+            lines.append(f"- {row['name']} (ИНН `{row['inn']}`){site}")
+        lines.append("")
+        lines.append(
+            "Если хотите написать им руками — посмотрите, что нашлось: "
+            "`sqlite3 data/leads.db < tools/thin.sql`"
+        )
         lines.append("")
 
     problems = log.problems()
@@ -295,9 +329,12 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
     path = MORNING_DIR / f"{today}.md"
     path.write_text("\n".join(lines), encoding="utf-8")
 
-    db.mark_reported(conn, [], [row["inn"] for row in rows])
+    # Отложенные тоже помечаем показанными: они попали в хвост отчёта, и
+    # каждое утро повторять их незачем. Найти их потом — tools/thin.sql.
+    db.mark_reported(conn, [], [row["inn"] for row in rows] + [r["inn"] for r in thin_rows])
     conn.commit()
     conn.close()
 
-    logger.info("Утренний список готов: %s (%d компаний)", path, len(rows))
+    logger.info("Утренний список готов: %s (%d писем, отложено %d)",
+                path, len(rows), len(thin_rows))
     return path

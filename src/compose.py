@@ -11,6 +11,9 @@
 
 Письмо не отправляется. Оно попадает в утренний список, где вы его читаете,
 правите и отправляете руками.
+
+Письмо, не набравшее минимума фактов из досье (compose.min_facts в icp.yaml),
+в утренний список не идёт вовсе — см. DECISIONS.md, Р-024.
 """
 
 from __future__ import annotations
@@ -62,9 +65,12 @@ def build_system_prompt(site_type: str) -> str:
         "`why_line` — одна строка для утреннего списка, объясняющая, почему "
         "эта компания здесь; `facts_used` — список фактов из досье, на "
         "которые ты реально сослался в письме.\n\n"
-        "`facts_used` нужен для самопроверки: если список пуст или в нём "
-        "общие слова, письмо получилось шаблонным и его нужно переписать "
-        "конкретнее."
+        "`facts_used` — не украшение, а самопроверка. Перечисляй только то, "
+        "что действительно попало в текст письма, дословно или близко. "
+        "Общие слова вроде «IT-компания» фактом не считаются. Письмо, "
+        "набравшее меньше двух фактов, человеку не показывается: лучше "
+        "не написать письма вовсе, чем написать такое, которое выдаёт себя "
+        "за найденное системой и при этом подходит кому угодно."
     )
 
 
@@ -112,7 +118,9 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
     """Генерирует письма для компаний, прошедших классификацию по сайту."""
     site_cfg = config.get("website", {})
     target_types = site_cfg.get("target_types") or ["outsourcing", "staffing"]
-    per_run = limit or int(config.get("compose", {}).get("per_run", 20))
+    compose_cfg = config.get("compose", {})
+    per_run = limit or int(compose_cfg.get("per_run", 20))
+    min_facts = int(compose_cfg.get("min_facts", 2))
 
     placeholders = ",".join("?" for _ in target_types)
     conn = db.connect()
@@ -161,34 +169,44 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
         facts_used = result.get("facts_used") or []
         body = result.get("body", "")
 
-        # Самопроверка: письмо без опоры на факты — это шаблон, и отправлять
-        # его нельзя. Помечаем, чтобы в утреннем списке было видно.
-        thin = len(facts_used) < 2
+        # Самопроверка. Письмо говорит адресату, что его компанию и факт о ней
+        # нашла система. Если факт при этом один и общий, письмо опровергает
+        # само себя, поэтому такое письмо человеку не показывается вовсе.
+        thin = len(facts_used) < min_facts
+        status = "thin" if thin else "ok"
+
         if thin:
             counters["thin"] += 1
-
-        counters["written"] += 1
-        logger.info("%s %s — %s", "!" if thin else "✓", name, result.get("why_line", ""))
-        if thin:
-            logger.warning("  ↳ письмо опирается всего на %d факт(а) — проверьте глазами",
-                           len(facts_used))
+            # Уровень INFO, а не WARNING: это штатный исход, а не поломка.
+            # В блок «Проблемы прогона» ему попадать незачем — отложенные
+            # письма и так перечислены в хвосте отчёта отдельным разделом.
+            logger.info(
+                "— %s: фактов %d из %d — письмо отложено, в утренний список не пойдёт",
+                name, len(facts_used), min_facts,
+            )
+        else:
+            counters["written"] += 1
+            logger.info("✓ %s — %s", name, result.get("why_line", ""))
 
         if not dry_run:
             conn.execute(
                 """
                 UPDATE companies SET
                     letter_subject = ?, letter_body = ?, letter_why = ?,
-                    letter_facts = ?, letter_written_at = ?
+                    letter_facts = ?, letter_status = ?, letter_written_at = ?
                 WHERE inn = ?
                 """,
                 (result.get("subject", ""), body, result.get("why_line", ""),
-                 json.dumps(facts_used, ensure_ascii=False), db.now(), row["inn"]),
+                 json.dumps(facts_used, ensure_ascii=False), status,
+                 db.now(), row["inn"]),
             )
 
     if not dry_run:
         conn.commit()
     conn.close()
 
-    logger.info("Письма: написано %d, не удалось %d, требуют проверки %d",
-                counters["written"], counters["failed"], counters["thin"])
+    logger.info("Письма: годных %d, отложено (мало фактов) %d, не удалось %d",
+                counters["written"], counters["thin"], counters["failed"])
+    if counters["thin"]:
+        logger.info("Отложенные письма: sqlite3 data/leads.db < tools/thin.sql")
     return counters

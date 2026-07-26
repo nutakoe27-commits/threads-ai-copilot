@@ -537,10 +537,34 @@ def main() -> int:
           "Про этого адресата" in compose.build_system_prompt("нет_такого_типа"))
     check("общие запреты попали в промпт",
           "восклицательные знаки" in compose.build_system_prompt("product"))
-    check("продуктовым говорим про их ICP",
-          "ICP острее" in compose.build_system_prompt("product"))
-    check("аутсорсу говорим про предсказуемость потока",
-          "предсказуемость потока" in compose.build_system_prompt("outsourcing"))
+    check("продуктовым говорим про их покупателя",
+          "кто покупатель" in compose.build_system_prompt("product"))
+    check("аутсорсу говорим про специализацию",
+          "специализацию" in compose.build_system_prompt("outsourcing"))
+
+    # Каркас без оффера: письмо задаёт вопрос и ничего не предлагает.
+    # Проверяем не косметику, а то, что в промпте нет обещаний, за которые
+    # потом придётся отвечать руками (DECISIONS.md, Р-023).
+    letter_frame = compose.load_prompt("letter.md")
+    check("в каркасе есть финальный вопрос про удачного клиента",
+          "вот таких бы побольше" in letter_frame)
+    check("каркас запрещает любые предложения",
+          "Никаких предложений" in letter_frame)
+    check("каркас запрещает скрытые предложения",
+          "готов обсудить" in letter_frame)
+    check("из каркаса убран бесплатный список компаний",
+          "20 компаний" not in letter_frame and "Бесплатно" not in letter_frame,
+          "остался старый оффер")
+    check("незаполненных маркеров в каркасе не осталось",
+          "ЗАПОЛНИТЬ" not in letter_frame)
+    check("подпись задана в конфиге, а не в коде",
+          "Михаил" in letter_frame)
+
+    for angle_type in ("product", "outsourcing", "staffing", "integrator", "default"):
+        angle_text = compose.load_prompt(f"angles/{angle_type}.md")
+        check(f"угол «{angle_type}» ничего не предлагает",
+              "редлаг" not in angle_text.replace("Ничего не предлагает", ""),
+              angle_text[:200])
 
     print("\n[20] Сквозной прогон: досье → письмо → утренний список")
     with tempfile.TemporaryDirectory() as tmp:
@@ -558,8 +582,17 @@ def main() -> int:
             "'info@alta.ru','62.01','Разработка ПО',88,310e6,243e6,27.5,'passed','t',"
             "'https://alta.ru','product',0.92,'Софт для таможенного оформления',"
             "'[\"таможня\", \"ВЭД\"]','t')")
+        # Вторая компания — с пустым досье. На ней проверяем, что письмо
+        # без фактов до утреннего списка не доходит.
+        conn.execute(
+            "INSERT INTO companies (inn,name,first_seen,last_seen,region,"
+            "okved,okved_name,staff,revenue,icp_status,checked_at,site_url,"
+            "site_type,site_confidence,site_summary,site_checked_at) "
+            "VALUES ('7702','ООО \"ПУСТО\"','t','t','Москва','62.01',"
+            "'Разработка ПО',30,90e6,'passed','t','https://pusto.ru',"
+            "'outsourcing',0.5,'IT-компания','t')")
         conn.commit()
-        row = conn.execute("SELECT * FROM companies").fetchone()
+        row = conn.execute("SELECT * FROM companies WHERE inn='7701'").fetchone()
         dossier_text = compose.build_dossier(row)
         conn.close()
 
@@ -575,10 +608,20 @@ def main() -> int:
         captured: dict = {}
 
         def fake_classify(system_prompt, user_content, schema, max_tokens=1024):
-            captured["system"] = system_prompt
-            captured["user"] = user_content
+            # Ключуем по компании: иначе второй вызов затирает первый и
+            # проверка «дошёл ли нужный угол» становится бессмысленной.
+            key = "пусто" if "ПУСТО" in user_content else "альта"
+            captured[key] = {"system": system_prompt, "user": user_content}
+            # У пустой компании модель честно не находит, на что опереться.
+            if "ПУСТО" in user_content:
+                return {
+                    "subject": "вопрос про ваших клиентов",
+                    "body": "Вы занимаетесь разработкой...",
+                    "why_line": "IT-компания подходящего размера",
+                    "facts_used": ["IT-компания"],
+                }
             return {
-                "subject": "Как находить импортёров до тендера",
+                "subject": "про ваши проекты для импортёров",
                 "body": "Вы продаёте софт для таможенного оформления...",
                 "why_line": "продуктовая компания с чётким ICP, выручка растёт",
                 "facts_used": ["софт для таможенного оформления", "88 человек"],
@@ -591,23 +634,31 @@ def main() -> int:
         finally:
             llm.classify = original
 
-        check("письмо написано", result["written"] == 1, str(result))
-        check("письмо не помечено как шаблонное", result["thin"] == 0, str(result))
+        check("годное письмо написано", result["written"] == 1, str(result))
+        check("письмо без фактов отложено", result["thin"] == 1, str(result))
         check("модель получила угол для продуктовой компании",
-              "ICP острее" in captured.get("system", ""))
+              "кто покупатель" in captured.get("альта", {}).get("system", ""))
+        check("аутсорсеру ушёл другой угол",
+              "специализацию" in captured.get("пусто", {}).get("system", ""))
         check("модель получила факты из досье",
-              "таможенного оформления" in captured.get("user", ""))
+              "таможенного оформления" in captured.get("альта", {}).get("user", ""))
+        check("модель получила требование не выдумывать",
+              "Ничего не выдумывай" in captured.get("альта", {}).get("system", ""))
 
         path = report.build_morning(icp_full)
         check("утренний список создан", path is not None and path.exists())
         if path:
             text = path.read_text(encoding="utf-8")
             check("в списке есть строка «Почему здесь»", "**Почему здесь:**" in text)
-            check("в списке есть тема письма", "Как находить импортёров" in text)
+            check("в списке есть тема письма", "про ваши проекты для импортёров" in text)
             check("в списке есть текст письма", "софт для таможенного оформления" in text)
             check("в списке указан тип компании", "продуктовая компания" in text)
             check("напоминание не хранить ФИО на месте",
                   "система не хранит" in text)
+            check("письмо без фактов в основной список не попало",
+                  "Вы занимаетесь разработкой" not in text, text)
+            check("отложенная компания названа в хвосте",
+                  "Отложено" in text and "ПУСТО" in text, text)
 
         check("повторный список пуст", report.build_morning(icp_full) is None)
 
