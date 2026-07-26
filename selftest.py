@@ -20,7 +20,8 @@ from pathlib import Path
 import yaml
 
 from src import collect, db, log, report
-from src.sources.trudvsem import TrudvsemClient
+from src.sources import trudvsem as trudvsem_module
+from src.sources.trudvsem import TrudvsemClient, TrudvsemError
 
 FAILURES: list[str] = []
 
@@ -190,6 +191,7 @@ def main() -> int:
                 "created_date": vacancy["created_date"], "strength": strength,
                 "matched": "; ".join(hits),
                 "excerpt": collect.excerpt_around(vacancy["duty"], hits[0]),
+                "specialisation": vacancy["specialisation"],
             }):
                 written += 1
         conn.commit()
@@ -200,7 +202,7 @@ def main() -> int:
         again = db.insert_signal(conn, {
             "vacancy_id": "v-001", "inn": "7701234567", "company_name": "x",
             "job_name": "x", "region": "x", "url": "x", "created_date": "x",
-            "strength": "strong", "matched": "x", "excerpt": "x",
+            "strength": "strong", "matched": "x", "excerpt": "x", "specialisation": "x",
         })
         check("повторная вакансия не записывается", again is False)
 
@@ -226,6 +228,83 @@ def main() -> int:
         # Повторная сборка не должна показать те же компании снова.
         second = report.build(config)
         check("повторный отчёт пуст (нет повторов)", second is None)
+
+    print("\n[6] Пагинация: offset — это номер страницы, а не смещение")
+    calls: list[dict] = []
+
+    def fake_get(self, url, params):
+        """Подменяет HTTP: две страницы по 2 записи, на третьей — ошибка."""
+        calls.append(dict(params))
+        page = params["offset"]
+        if page >= 2:
+            raise TrudvsemError("HTTP 500 (страницы не существует)")
+        return {
+            "meta": {"total": 4},
+            "results": {"vacancies": [
+                {"vacancy": {"id": f"p{page}-a"}},
+                {"vacancy": {"id": f"p{page}-b"}},
+            ]},
+        }
+
+    original_get = TrudvsemClient._get
+    original_sleep = trudvsem_module.time.sleep
+    TrudvsemClient._get = fake_get
+    trudvsem_module.time.sleep = lambda _s: None
+    try:
+        client = TrudvsemClient({"page_size": 2, "max_pages_per_region": 10})
+        collected = list(client.fetch_region("7700000000000", "Тест"))
+    finally:
+        TrudvsemClient._get = original_get
+        trudvsem_module.time.sleep = original_sleep
+
+    check("собраны все 4 записи", len(collected) == 4, f"получено {len(collected)}")
+    check("offset увеличивается по единице (0, 1)",
+          [c["offset"] for c in calls] == [0, 1], str([c["offset"] for c in calls]))
+    check("остановились по total, не дойдя до ошибки", len(calls) == 2, f"запросов {len(calls)}")
+
+    print("\n[7] Пагинация: сбой на середине не теряет уже собранное")
+    calls.clear()
+
+    def failing_get(self, url, params):
+        calls.append(dict(params))
+        page = params["offset"]
+        if page >= 1:
+            raise TrudvsemError("HTTP 500")
+        return {"meta": {"total": 100}, "results": {"vacancies": [{"vacancy": {"id": "a"}}]}}
+
+    TrudvsemClient._get = failing_get
+    trudvsem_module.time.sleep = lambda _s: None
+    try:
+        client = TrudvsemClient({"page_size": 1, "max_pages_per_region": 10})
+        partial = list(client.fetch_region("7700000000000", "Тест"))
+    finally:
+        TrudvsemClient._get = original_get
+        trudvsem_module.time.sleep = original_sleep
+
+    check("первая страница сохранена, регион не упал", len(partial) == 1)
+
+    print("\n[8] Отраслевой фильтр")
+    check("include пропускает нужную отрасль",
+          any("информационные технологии" in s
+              for s in ["Информационные технологии, связь".lower()]))
+    parsed_spec = TrudvsemClient.parse({
+        "id": "s-1", "job-name": "Менеджер по продажам",
+        "category": {"specialisation": "Информационные технологии, связь"},
+        "company": {"inn": "1", "name": "x"},
+    })
+    check("отрасль извлекается из ответа",
+          parsed_spec["specialisation"] == "Информационные технологии, связь")
+
+    print("\n[9] Стоп-слова, добавленные после боевого прогона")
+    for job, why in [
+        ("Специалист по работе с физическими лицами в точку продаж банка", "банковская розница"),
+        ("Главный врач, медицинский директор", "медицина"),
+        ("Менеджер по работе с клиентами (недвижимость)", "недвижимость"),
+        ("Специалист по продажам проектов/Дизайнер-консультант", "розничный дизайнер"),
+    ]:
+        check(f"отсеивается: {why}",
+              collect.match_keywords(job, "активные продажи, формирование базы", keywords) is None,
+              f"«{job}» всё ещё проходит")
 
     print()
     if FAILURES:

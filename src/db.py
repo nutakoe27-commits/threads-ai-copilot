@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS signals (
     strength        TEXT NOT NULL,          -- strong | normal
     matched         TEXT,                   -- совпавшие ключевые слова через ;
     excerpt         TEXT,                   -- фрагмент текста вакансии
+    specialisation  TEXT,                   -- отрасль по классификатору trudvsem
     collected_at    TEXT NOT NULL,
     reported_at     TEXT,
     FOREIGN KEY (inn) REFERENCES companies(inn)
@@ -75,13 +76,25 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# Колонки, добавленные после первой версии схемы. SQLite не умеет
+# "ADD COLUMN IF NOT EXISTS", поэтому проверяем наличие руками.
+MIGRATIONS = [("signals", "specialisation", "TEXT")]
+
+
 def connect(path: Path | None = None) -> sqlite3.Connection:
-    """Открывает базу, при необходимости создаёт схему."""
+    """Открывает базу, при необходимости создаёт схему и до-накатывает колонки."""
     db_path = path or DB_PATH
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+
+    for table, column, column_type in MIGRATIONS:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+            logger.info("Схема обновлена: %s.%s", table, column)
+    conn.commit()
     return conn
 
 
@@ -136,9 +149,10 @@ def insert_signal(conn: sqlite3.Connection, signal: dict[str, Any]) -> bool:
             """
             INSERT INTO signals (vacancy_id, inn, company_name, job_name, region,
                                  url, created_date, strength, matched, excerpt,
-                                 collected_at)
+                                 specialisation, collected_at)
             VALUES (:vacancy_id, :inn, :company_name, :job_name, :region,
-                    :url, :created_date, :strength, :matched, :excerpt, :ts)
+                    :url, :created_date, :strength, :matched, :excerpt,
+                    :specialisation, :ts)
             """,
             {**signal, "ts": now()},
         )

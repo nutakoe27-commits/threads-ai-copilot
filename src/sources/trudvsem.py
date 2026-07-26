@@ -96,20 +96,40 @@ class TrudvsemClient:
             "%Y-%m-%dT00:00:00Z"
         )
 
-        offset = 0
+        # ВАЖНО: в этом API `offset` — НОМЕР СТРАНИЦЫ, а не смещение в записях.
+        # Первая же боевая проверка это показала: после 100 записей запрос с
+        # offset=100 вернул HTTP 500, потому что страницы №100 не существует
+        # (в Москве их 31). Считаем страницами.
+        page = 0
         total: int | None = None
-        pages = 0
+        received = 0
 
-        while pages < self.max_pages:
-            payload = self._get(
-                url,
-                {"offset": offset, "limit": self.page_size, "modifiedFrom": modified_from},
-            )
+        while page < self.max_pages:
+            try:
+                payload = self._get(
+                    url,
+                    {"offset": page, "limit": self.page_size, "modifiedFrom": modified_from},
+                )
+            except TrudvsemError:
+                if page == 0:
+                    raise  # регион не открылся вообще — это ошибка
+                # Данные уже частично получены: не роняем регион из-за
+                # последней страницы, просто фиксируем и идём дальше.
+                logger.warning(
+                    "Регион %s: страница %d не отдалась, продолжаем с тем, "
+                    "что успели получить (%d вакансий)",
+                    region_name, page, received,
+                )
+                break
 
             meta = payload.get("meta") or {}
             if total is None:
                 total = int(meta.get("total") or 0)
-                logger.info("Регион %s: всего доступно %d вакансий", region_name, total)
+                pages_total = (total + self.page_size - 1) // self.page_size
+                logger.info(
+                    "Регион %s: доступно %d вакансий (%d страниц)",
+                    region_name, total, pages_total,
+                )
                 if total == 0:
                     logger.warning(
                         "Регион %s (код %s) вернул 0 вакансий — вероятно, неверный "
@@ -126,17 +146,18 @@ class TrudvsemClient:
                 # Каждый элемент обёрнут: {"vacancy": {...}}
                 yield item.get("vacancy", item)
 
-            pages += 1
-            offset += len(items)
-            if total is not None and offset >= total:
+            received += len(items)
+            page += 1
+
+            if total is not None and received >= total:
                 break
             time.sleep(0.3)  # вежливая пауза между страницами
 
-        if pages >= self.max_pages:
+        if page >= self.max_pages:
             logger.warning(
-                "Регион %s: упёрлись в потолок max_pages_per_region=%d. "
-                "Часть вакансий не просмотрена — уменьшите lookback_days",
-                region_name, self.max_pages,
+                "Регион %s: упёрлись в потолок max_pages_per_region=%d "
+                "(просмотрено %d из %d). Уменьшите lookback_days или поднимите потолок",
+                region_name, self.max_pages, received, total or 0,
             )
 
     # ---------------------------------------------------------------- разбор
@@ -146,6 +167,7 @@ class TrudvsemClient:
         """Приводит сырую запись к плоскому виду, который понимает остальной код."""
         company = raw.get("company") or {}
         region = raw.get("region") or {}
+        category = raw.get("category") or {}
 
         inn = str(_pick(company, "inn", "INN")).strip()
         # У API встречается и строковое "true", и настоящий bool.
@@ -166,4 +188,7 @@ class TrudvsemClient:
             "company_phone": str(_pick(company, "phone")),
             "hr_agency": bool(hr_agency),
             "region": str(_pick(region, "name", "region_name", default="")),
+            # Отраслевой классификатор самого trudvsem. Дешёвый способ отсечь
+            # розницу, медицину и банки ещё до платных запросов в Checko.
+            "specialisation": str(_pick(category, "specialisation", "spec", default="")),
         }

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from collections import Counter
 from typing import Any
 
 from . import db, log
@@ -117,8 +118,18 @@ def run(config: dict[str, Any], dry_run: bool = False, raw: bool = False) -> dic
     stoplist = db.load_stoplist()
 
     counters = {"fetched": 0, "matched": 0, "new_signals": 0, "skipped_hr": 0,
-                "skipped_no_inn": 0, "skipped_stoplist": 0, "duplicates": 0}
+                "skipped_no_inn": 0, "skipped_stoplist": 0, "skipped_spec": 0,
+                "duplicates": 0}
     raw_dumped = False
+
+    # Диагностика: какие отрасли и ключевые слова реально дают совпадения.
+    # Нужно, чтобы решать по данным, а не на глаз: подходит ли нам источник
+    # и какие слова тащат мусор.
+    spec_stats: Counter[str] = Counter()
+    keyword_stats: Counter[str] = Counter()
+
+    spec_include = [s.lower() for s in filters.get("specialisation_include", []) or []]
+    spec_exclude = [s.lower() for s in filters.get("specialisation_exclude", []) or []]
 
     for region in source_cfg.get("regions", []) or config.get("regions", []):
         code, name = region["code"], region["name"]
@@ -156,7 +167,21 @@ def run(config: dict[str, Any], dry_run: bool = False, raw: bool = False) -> dic
                     continue
 
                 strength, hits = verdict
+
+                # Отраслевой фильтр по классификатору trudvsem. Пустые списки
+                # в конфиге = фильтр выключен (нужно, чтобы сначала посмотреть
+                # статистику и узнать реальные названия отраслей).
+                spec = (vacancy.get("specialisation") or "").lower()
+                if spec_include and not any(s in spec for s in spec_include):
+                    counters["skipped_spec"] += 1
+                    continue
+                if spec_exclude and any(s in spec for s in spec_exclude):
+                    counters["skipped_spec"] += 1
+                    continue
+
                 counters["matched"] += 1
+                spec_stats[vacancy.get("specialisation") or "(не указана)"] += 1
+                keyword_stats.update(hits)
 
                 if dry_run:
                     logger.info(
@@ -185,6 +210,7 @@ def run(config: dict[str, Any], dry_run: bool = False, raw: bool = False) -> dic
                     "strength": strength,
                     "matched": "; ".join(hits),
                     "excerpt": excerpt_around(vacancy["duty"], hits[0]),
+                    "specialisation": vacancy.get("specialisation", ""),
                 })
 
                 if is_new:
@@ -213,9 +239,36 @@ def run(config: dict[str, Any], dry_run: bool = False, raw: bool = False) -> dic
 
     logger.info(
         "Итог сбора: получено %d, подошло %d, новых %d, дублей %d "
-        "(отсеяно: кадровых агентств %d, без ИНН %d, по стоп-листу %d)",
+        "(отсеяно: кадровых агентств %d, без ИНН %d, по стоп-листу %d, по отрасли %d)",
         counters["fetched"], counters["matched"], counters["new_signals"],
         counters["duplicates"], counters["skipped_hr"],
-        counters["skipped_no_inn"], counters["skipped_stoplist"],
+        counters["skipped_no_inn"], counters["skipped_stoplist"], counters["skipped_spec"],
     )
+
+    _log_diagnostics(spec_stats, keyword_stats)
     return counters
+
+
+def _log_diagnostics(spec_stats: Counter[str], keyword_stats: Counter[str]) -> None:
+    """Показывает, откуда берутся совпадения.
+
+    Две таблицы отвечают на два разных вопроса:
+      * отрасли — есть ли в источнике вообще наш ICP;
+      * ключевые слова — какие из них тащат мусор и подлежат правке.
+    """
+    if not spec_stats:
+        return
+
+    logger.info("--- Отрасли среди совпавших вакансий (классификатор trudvsem):")
+    for name, count in spec_stats.most_common(15):
+        logger.info("      %4d  %s", count, name)
+
+    logger.info("--- Сработавшие ключевые слова:")
+    for name, count in keyword_stats.most_common(15):
+        logger.info("      %4d  %s", count, name)
+
+    logger.info(
+        "Подсказка: скопируйте нужные названия отраслей в "
+        "filters.specialisation_include в config/signals.yaml — это отсечёт "
+        "розницу и банки бесплатно, до платных запросов в Checko"
+    )
