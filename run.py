@@ -55,7 +55,7 @@ def main() -> int:
     parser.add_argument(
         "--stage",
         choices=["targets", "discover", "enrich", "rejudge", "dossier",
-                 "compose", "morning", "collect", "report", "all"],
+                 "compose", "morning", "cleanup", "collect", "report", "all"],
         default="all",
         help=(
             "targets — построить целевой список через Checko (discover + enrich); "
@@ -64,6 +64,7 @@ def main() -> int:
             "dossier — обойти сайты прошедших ICP и классифицировать их; "
             "compose — написать письма по досье; "
             "morning — собрать утренний список с письмами; "
+            "cleanup — убрать из базы личные адреса, сохранённые до появления фильтра; "
             "collect/report — сбор сигналов и утренний список"
         ),
     )
@@ -94,6 +95,9 @@ def main() -> int:
                     targets.discover(icp_config, dry_run=args.dry_run)
                 if args.stage in ("targets", "enrich"):
                     targets.enrich(icp_config, dry_run=args.dry_run)
+
+        if args.stage == "cleanup":
+            targets.cleanup_contacts(dry_run=args.dry_run)
 
         if args.stage == "dossier":
             dossier.run(load_config(ICP_CONFIG_PATH), dry_run=args.dry_run)

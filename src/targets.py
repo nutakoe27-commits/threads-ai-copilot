@@ -23,7 +23,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
-from . import db, log
+from . import contacts, db, log
 from .providers.checko import BudgetExhausted, CheckoClient, CheckoError, RequestBudget
 
 logger = log.get("targets")
@@ -320,7 +320,8 @@ def enrich(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
     logger.info("Компаний к проверке: %d (бюджет позволяет ~%d)",
                 len(candidates), budget.left // 2)
 
-    counters = {"checked": 0, "passed": 0, "rejected": 0, "saved_requests": 0}
+    counters = {"checked": 0, "passed": 0, "rejected": 0, "saved_requests": 0,
+                "personal_emails": 0}
     try:
         client = CheckoClient(provider_cfg, budget)
     except CheckoError as exc:
@@ -341,6 +342,15 @@ def enrich(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
 
             counters["checked"] += 1
             fields: dict[str, Any] = dict(company)
+
+            # Личный адрес сотрудника — персональные данные, и хранить его
+            # мы не будем (DECISIONS.md, Р-000 и Р-026). Отбрасываем до
+            # записи в базу, а не при показе.
+            raw_email = fields.get("email") or ""
+            if raw_email and not contacts.is_storable(raw_email):
+                fields["email"] = ""
+                counters["personal_emails"] += 1
+                logger.debug("ИНН %s: личный адрес не сохранён", inn)
 
             ok, reason = judge_profile(company, criteria)
             if not ok:
@@ -389,8 +399,44 @@ def enrich(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
     logger.info("Проверено %d: прошло ICP %d, отсеяно %d (сэкономлено запросов на финансы: %d)",
                 counters["checked"], counters["passed"], counters["rejected"],
                 counters["saved_requests"])
+    if counters["personal_emails"]:
+        logger.info("Личных адресов не сохранено: %d (персональные данные, Р-026)",
+                    counters["personal_emails"])
     logger.info("Целевой список: %s. Ждут проверки: %d",
                 ", ".join(f"{k}: {v}" for k, v in sorted(summary.items())), remaining)
+    return counters
+
+
+def cleanup_contacts(dry_run: bool = False) -> dict[str, int]:
+    """Разовая чистка: убирает из базы личные адреса, сохранённые раньше.
+
+    Фильтр появился позже самой базы, поэтому уже записанные адреса надо
+    один раз пересмотреть. Отдельный этап, а не молчаливая правка при
+    подключении к базе: удаление данных должно быть видимым действием.
+    """
+    conn = db.connect()
+    rows = conn.execute(
+        "SELECT inn, name, contact_email FROM companies "
+        "WHERE contact_email IS NOT NULL AND contact_email != ''"
+    ).fetchall()
+
+    counters = {"checked": len(rows), "removed": 0}
+    for row in rows:
+        kind, note = contacts.classify(row["contact_email"])
+        if kind != "personal":
+            continue
+        counters["removed"] += 1
+        logger.info("— %s: %s (%s) — удаляем", row["name"], row["contact_email"], note)
+        if not dry_run:
+            conn.execute("UPDATE companies SET contact_email = '' WHERE inn = ?",
+                         (row["inn"],))
+
+    if not dry_run:
+        conn.commit()
+    conn.close()
+
+    logger.info("Адресов проверено %d, личных удалено %d",
+                counters["checked"], counters["removed"])
     return counters
 
 

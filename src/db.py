@@ -123,6 +123,10 @@ MIGRATIONS = [
     ("companies", "site_confidence", "REAL"),
     ("companies", "site_summary", "TEXT"),
     ("companies", "site_specialization", "TEXT"),
+    # Конкретные факты с сайта, каждый подтверждён цитатой из его текста.
+    # Из них строится наблюдение в письме; без них письмо получается
+    # пересказом того, что адресат и так знает (DECISIONS.md, Р-025).
+    ("companies", "site_facts", "TEXT"),
     ("companies", "site_checked_at", "TEXT"),
     ("companies", "site_error", "TEXT"),
     # Этап 3б: сгенерированное письмо. Не отправляется — попадает

@@ -22,7 +22,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from . import db, llm, log
+from . import db, facts as factlib, llm, log
 
 logger = log.get("compose")
 
@@ -74,44 +74,67 @@ def build_system_prompt(site_type: str) -> str:
     )
 
 
+def site_facts(row: Any) -> list[str]:
+    """Проверенные факты с сайта компании. На них строится наблюдение."""
+    try:
+        values = json.loads(row["site_facts"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return [str(value) for value in values if str(value).strip()]
+
+
 def build_dossier(row: Any) -> str:
-    """Собирает досье компании — единственный источник фактов для письма."""
-    facts: list[str] = [f"Название: {row['name']}"]
+    """Собирает досье компании — единственный источник фактов для письма.
+
+    Досье разделено на две части намеренно. Наверху — конкретика с сайта,
+    из которой пишется наблюдение. Внизу — реестровые данные: они нужны,
+    чтобы модель понимала масштаб компании, но писать о них в письме
+    нельзя, иначе получается «я посмотрел вашу отчётность».
+    """
+    lines: list[str] = [f"Компания: {row['name']}"]
+
+    facts = site_facts(row)
+    if facts:
+        lines.append("")
+        lines.append("НАЙДЕНО НА ИХ САЙТЕ — из этого пишется наблюдение:")
+        lines.extend(f"  {index}. {fact}" for index, fact in enumerate(facts, start=1))
 
     if row["site_summary"]:
-        facts.append(f"Чем занимается (с их сайта): {row['site_summary']}")
+        lines.append("")
+        lines.append(f"Чем занимается в целом: {row['site_summary']}")
     if row["site_specialization"]:
         try:
             spec = json.loads(row["site_specialization"])
             if spec:
-                facts.append(f"Специализация: {', '.join(spec)}")
+                lines.append(f"Специализация: {', '.join(spec)}")
         except (json.JSONDecodeError, TypeError):
             pass
-    if row["site_url"]:
-        facts.append(f"Сайт: {row['site_url']}")
-    if row["region"]:
-        facts.append(f"Регион: {row['region']}")
-    if row["staff"]:
-        facts.append(f"Численность: {row['staff']:.0f} человек")
 
+    background: list[str] = []
+    if row["region"]:
+        background.append(f"регион: {row['region']}")
+    if row["staff"]:
+        background.append(f"численность: {row['staff']:.0f} человек")
     if row["revenue"]:
-        line = f"Выручка: {row['revenue'] / 1e6:.0f} млн ₽"
+        line = f"выручка: {row['revenue'] / 1e6:.0f} млн ₽"
         if row["revenue_change_pct"] is not None:
             line += f" ({row['revenue_change_pct']:+.0f}% год к году)"
-        facts.append(line)
-        if row["staff"]:
-            facts.append(
-                f"Выручка на сотрудника: {row['revenue'] / row['staff'] / 1e6:.1f} млн ₽"
-            )
-
+        background.append(line)
     if row["okved_name"]:
-        facts.append(f"Основной вид деятельности по реестру: {row['okved_name']}")
+        background.append(f"вид деятельности по реестру: {row['okved_name']}")
 
-    facts.append(
-        "\nВНИМАНИЕ: это все факты, которые есть. Ничего сверх этого списка "
+    if background:
+        lines.append("")
+        lines.append("ДЛЯ ПОНИМАНИЯ МАСШТАБА — в тексте письма не упоминать "
+                     "(в why_line можно):")
+        lines.extend(f"  {item}" for item in background)
+
+    lines.append("")
+    lines.append(
+        "ВНИМАНИЕ: это все факты, которые есть. Ничего сверх этого списка "
         "в письме быть не должно."
     )
-    return "\n".join(facts)
+    return "\n".join(lines)
 
 
 def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None) -> dict[str, int]:
@@ -130,6 +153,7 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
         WHERE icp_status = 'passed'
           AND site_type IN ({placeholders})
           AND letter_body IS NULL
+          AND letter_status IS NULL
         ORDER BY
             CASE WHEN revenue_change_pct IS NULL THEN 1 ELSE 0 END,
             revenue_change_pct
@@ -149,6 +173,23 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
     counters = {"written": 0, "failed": 0, "thin": 0}
     for row in rows:
         name = row["name"]
+
+        # Если фактов с сайта меньше минимума, письмо всё равно окажется
+        # шаблонным — модель не может опереться на то, чего нет. Не тратим
+        # на это ни токенов, ни времени.
+        if len(site_facts(row)) < min_facts:
+            counters["thin"] += 1
+            logger.info("— %s: фактов с сайта %d из %d — письмо не пишем",
+                        name, len(site_facts(row)), min_facts)
+            if not dry_run:
+                conn.execute(
+                    "UPDATE companies SET letter_status = 'thin', "
+                    "letter_why = ?, letter_written_at = ? WHERE inn = ?",
+                    ("на сайте не нашлось конкретики для наблюдения",
+                     db.now(), row["inn"]),
+                )
+            continue
+
         try:
             system_prompt = build_system_prompt(row["site_type"] or "default")
         except FileNotFoundError as exc:
@@ -166,12 +207,21 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
             logger.warning("— %s: письмо не написалось (%s)", name, exc)
             continue
 
-        facts_used = result.get("facts_used") or []
         body = result.get("body", "")
 
-        # Самопроверка. Письмо говорит адресату, что его компанию и факт о ней
-        # нашла система. Если факт при этом один и общий, письмо опровергает
-        # само себя, поэтому такое письмо человеку не показывается вовсе.
+        # Проверку считаем сами. Список `facts_used`, который возвращает
+        # модель, — это её самоотчёт: в него попадает то, что она собиралась
+        # использовать, а не то, что оказалось в тексте. Проверка, которую
+        # можно пройти, дописав строчку, ничего не проверяет (Р-025).
+        available = site_facts(row)
+        facts_used = factlib.used_facts(available, body)
+        claimed = result.get("facts_used") or []
+        if len(claimed) > len(facts_used):
+            logger.debug("%s: модель заявила фактов %d, в тексте нашлось %d",
+                         name, len(claimed), len(facts_used))
+
+        # Письмо говорит адресату, что его компанию и факт о ней нашла
+        # система. Если факта в тексте нет, письмо опровергает само себя.
         thin = len(facts_used) < min_facts
         status = "thin" if thin else "ok"
 

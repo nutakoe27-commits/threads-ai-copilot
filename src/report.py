@@ -15,7 +15,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from . import db, log
+from . import contacts as contactlib, db, log
 
 logger = log.get("report")
 
@@ -190,7 +190,7 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
     # идут, но и молча пропасть не должны — показываем именами в хвосте.
     thin_rows = conn.execute(
         f"""
-        SELECT inn, name, site_url, letter_facts FROM companies
+        SELECT inn, name, site_url, letter_why FROM companies
         WHERE letter_status = 'thin'
           AND site_type IN ({placeholders})
           AND last_reported IS NULL
@@ -270,13 +270,19 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
             lines.append(f"_{row['site_summary']}_")
             lines.append("")
 
-        contacts = []
+        where = []
         if row["site_url"]:
-            contacts.append(f"[сайт]({row['site_url']})")
+            where.append(f"[сайт]({row['site_url']})")
         if row["contact_email"]:
-            contacts.append(f"`{row['contact_email']}`")
-        contacts.append(f"ИНН `{row['inn']}`")
-        lines.append(" · ".join(contacts))
+            note = contactlib.label(row["contact_email"])
+            address = f"`{row['contact_email']}`"
+            # Куда именно попадёт письмо, видно до отправки, а не после:
+            # tender@ читает тендерный отдел, письмо про клиентов ему не нужно.
+            where.append(f"{address} — ⚠️ {note}" if note else address)
+        else:
+            where.append("почты нет — ищите общий адрес на сайте")
+        where.append(f"ИНН `{row['inn']}`")
+        lines.append(" · ".join(where))
         lines.append("")
 
         lines.append(f"**Тема:** {row['letter_subject'] or '—'}")
@@ -287,7 +293,9 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
         lines.append("")
 
         if facts:
-            lines.append(f"<sub>Факты в письме: {'; '.join(facts)}</sub>")
+            # Не самоотчёт модели, а результат сверки: каждый факт найден
+            # и на сайте компании, и в тексте письма (DECISIONS.md, Р-025).
+            lines.append(f"<sub>Проверено — письмо опирается на: {'; '.join(facts)}</sub>")
             lines.append("")
 
         lines.append("---")
@@ -305,7 +313,8 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
         lines.append("")
         for row in thin_rows:
             site = f" — {row['site_url']}" if row["site_url"] else ""
-            lines.append(f"- {row['name']} (ИНН `{row['inn']}`){site}")
+            why = f" · {row['letter_why']}" if row["letter_why"] else ""
+            lines.append(f"- {row['name']} (ИНН `{row['inn']}`){site}{why}")
         lines.append("")
         lines.append(
             "Если хотите написать им руками — посмотрите, что нашлось: "

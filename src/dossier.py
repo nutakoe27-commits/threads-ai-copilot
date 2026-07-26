@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from . import db, llm, log
+from . import db, facts as factlib, llm, log
 from .sources.website import WebsiteFetcher
 
 logger = log.get("dossier")
@@ -35,8 +35,23 @@ CLASSIFY_SCHEMA: dict[str, Any] = {
         "confidence": {"type": "number"},
         "summary": {"type": "string"},
         "specialization": {"type": "array", "items": {"type": "string"}},
+        # Конкретика, из которой потом делается наблюдение в письме.
+        # `quote` — дословный кусок текста сайта: по нему факт проверяется
+        # кодом, без обращения к модели (DECISIONS.md, Р-025).
+        "facts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "fact": {"type": "string"},
+                    "quote": {"type": "string"},
+                },
+                "required": ["fact", "quote"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["type", "confidence", "summary", "specialization"],
+    "required": ["type", "confidence", "summary", "specialization", "facts"],
     "additionalProperties": False,
 }
 
@@ -48,6 +63,31 @@ TYPE_LABELS = {
     "not_it": "не про IT",
     "unknown": "не удалось определить",
 }
+
+
+def verify_facts(raw: list[Any], site_text: str) -> tuple[list[str], int]:
+    """Оставляет только те факты, чья цитата действительно есть на сайте.
+
+    Возвращает (проверенные факты, сколько отброшено). Отброшенные — это
+    либо выдумка, либо пересказ настолько вольный, что опираться на него
+    в письме опасно: письмо утверждает, что факт найден на сайте.
+    """
+    verified: list[str] = []
+    dropped = 0
+    for item in raw or []:
+        if not isinstance(item, dict):
+            dropped += 1
+            continue
+        fact = (item.get("fact") or "").strip()
+        quote = (item.get("quote") or "").strip()
+        if not fact or not quote:
+            dropped += 1
+            continue
+        if factlib.quote_found(quote, site_text):
+            verified.append(fact)
+        else:
+            dropped += 1
+    return verified, dropped
 
 
 def load_prompt(name: str) -> str:
@@ -109,7 +149,8 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
     target_types = site_cfg.get("target_types") or ["outsourcing", "staffing"]
 
     fetcher = WebsiteFetcher(site_cfg)
-    counters = {"checked": 0, "no_site": 0, "unreachable": 0, "classified": 0}
+    counters = {"checked": 0, "no_site": 0, "unreachable": 0, "classified": 0,
+                "facts": 0, "facts_dropped": 0}
     by_type: dict[str, int] = {}
 
     for row in rows:
@@ -154,11 +195,19 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
         site_type = verdict.get("type", "unknown")
         by_type[site_type] = by_type.get(site_type, 0) + 1
 
+        site_facts, dropped = verify_facts(verdict.get("facts"), result["text"])
+        counters["facts"] += len(site_facts)
+        counters["facts_dropped"] += dropped
+
         logger.info("%s %s — %s (уверенность %.0f%%): %s",
                     "✓" if site_type in target_types else "·",
                     name, TYPE_LABELS.get(site_type, site_type),
                     float(verdict.get("confidence", 0)) * 100,
                     verdict.get("summary", ""))
+        for fact in site_facts:
+            logger.info("      · %s", fact)
+        if dropped:
+            logger.warning("  ↳ %s: фактов не подтвердилось цитатой: %d", name, dropped)
 
         if not dry_run:
             _save(conn, row["inn"], {
@@ -168,6 +217,7 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
                 "site_summary": verdict.get("summary", ""),
                 "site_specialization": json.dumps(
                     verdict.get("specialization", []), ensure_ascii=False),
+                "site_facts": json.dumps(site_facts, ensure_ascii=False),
             })
 
     if not dry_run:
@@ -178,6 +228,11 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
                 "(без сайта %d, недоступны %d)",
                 counters["checked"], counters["classified"],
                 counters["no_site"], counters["unreachable"])
+    if counters["classified"]:
+        logger.info("Фактов собрано %d (в среднем %.1f на компанию), "
+                    "не подтвердилось цитатой %d",
+                    counters["facts"], counters["facts"] / counters["classified"],
+                    counters["facts_dropped"])
     if by_type:
         logger.info("--- Кто это оказался:")
         for site_type, count in sorted(by_type.items(), key=lambda x: -x[1]):
@@ -200,6 +255,7 @@ def _save(conn: Any, inn: str, fields: dict[str, Any], error: str = "") -> None:
             site_confidence = :site_confidence,
             site_summary = :site_summary,
             site_specialization = :site_specialization,
+            site_facts = :site_facts,
             site_error = :site_error,
             site_checked_at = :ts
         WHERE inn = :inn
@@ -211,6 +267,7 @@ def _save(conn: Any, inn: str, fields: dict[str, Any], error: str = "") -> None:
             "site_confidence": fields.get("site_confidence"),
             "site_summary": fields.get("site_summary"),
             "site_specialization": fields.get("site_specialization"),
+            "site_facts": fields.get("site_facts"),
             "site_error": error,
             "ts": db.now(),
         },

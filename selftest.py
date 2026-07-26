@@ -20,7 +20,8 @@ from pathlib import Path
 
 import yaml
 
-from src import collect, compose, db, dossier, llm, log, report, targets
+from src import (collect, compose, contacts, db, dossier, facts, llm, log,
+                 report, targets)
 from src.providers.checko import CheckoClient, RequestBudget, deep_pick, to_number
 from src.sources import trudvsem as trudvsem_module
 from src.sources.website import _TextExtractor, WebsiteFetcher, normalize_url
@@ -502,9 +503,9 @@ def main() -> int:
           schema_types == set(dossier.TYPE_LABELS), str(schema_types ^ set(dossier.TYPE_LABELS)))
     check("схема запрещает лишние поля",
           dossier.CLASSIFY_SCHEMA["additionalProperties"] is False)
-    check("обязательны все четыре поля",
+    check("обязательны все пять полей",
           set(dossier.CLASSIFY_SCHEMA["required"])
-          == {"type", "confidence", "summary", "specialization"})
+          == {"type", "confidence", "summary", "specialization", "facts"})
     check("промпт классификации на месте и не пуст",
           len(dossier.load_prompt("classify.md")) > 500)
     check("промпт описывает целевые категории",
@@ -566,6 +567,91 @@ def main() -> int:
               "редлаг" not in angle_text.replace("Ничего не предлагает", ""),
               angle_text[:200])
 
+    print("\n[21] Сверка фактов без модели")
+    site_text = (
+        "Компания разрабатывает систему LeakSPY для обнаружения утечек "
+        "в магистральных трубопроводах. Среди заказчиков — операторы "
+        "нефтепроводов. Работаем с 2004 года."
+    )
+    check("дословная цитата подтверждается",
+          facts.quote_found("систему LeakSPY для обнаружения утечек", site_text))
+    check("цитата в другом падеже подтверждается",
+          facts.quote_found("система LeakSPY для обнаружения утечки", site_text))
+    check("выдуманная цитата не подтверждается",
+          not facts.quote_found("сертифицирован по ISO 27001 с 2019 года", site_text))
+    check("пустая цитата не подтверждается", not facts.quote_found("", site_text))
+
+    letter_text = ("Здравствуйте.\n\nУ вас LeakSPY — система обнаружения утечек "
+                   "на магистральных трубопроводах.\n\nМихаил")
+    check("факт, отражённый в письме, засчитан",
+          facts.fact_used_in("Продукт LeakSPY для обнаружения утечек в трубопроводах",
+                             letter_text))
+    check("факт, которого в письме нет, не засчитан",
+          not facts.fact_used_in("Работают с 2004 года", letter_text))
+    check("общие слова не проходят за факт",
+          not facts.fact_used_in("Компания разрабатывает системы для бизнеса",
+                                 letter_text))
+    check("used_facts отбирает только настоящие",
+          facts.used_facts(["Продукт LeakSPY для обнаружения утечек",
+                            "Сертификат ISO 27001"], letter_text)
+          == ["Продукт LeakSPY для обнаружения утечек"])
+
+    print("\n[22] Почтовые адреса: что храним и куда попадёт письмо")
+    for address in ("tatiana.bakurskaya@i-rt.ru", "a.petrov@example.ru",
+                    "ivan@example.ru", "sergey.smirnov@example.com"):
+        kind, _ = contacts.classify(address)
+        check(f"{address} — личный", kind == "personal", kind)
+        check(f"{address} не сохраняется", not contacts.is_storable(address))
+        check(f"{address} обнуляется через safe()", contacts.safe(address) == "")
+
+    for address in ("info@example.ru", "sales@alta.ru", "zakaz@example.ru"):
+        kind, _ = contacts.classify(address)
+        check(f"{address} — безличный", kind == "role", kind)
+        check(f"{address} сохраняется", contacts.safe(address) == address)
+
+    kind, note = contacts.classify("tender@topsbi.ru")
+    check("tender@ распознан как чужой отдел", kind == "wrong_desk", kind)
+    check("для tender@ есть пояснение человеку", "тендер" in note, note)
+    check("tender@ всё равно сохраняется", contacts.is_storable("tender@topsbi.ru"))
+
+    kind, note = contacts.classify("host965@mail.ru")
+    check("бесплатная почта помечена", kind == "free", kind)
+    check("у бесплатной почты есть пояснение", bool(contacts.label("host965@mail.ru")))
+    check("у обычного info@ пояснения нет", contacts.label("info@example.ru") == "")
+
+    print("\n[23] Досье: факты с сайта проверяются цитатой")
+    verified, dropped = dossier.verify_facts(
+        [
+            {"fact": "Продукт LeakSPY", "quote": "систему LeakSPY для обнаружения утечек"},
+            {"fact": "Сертификат ISO 27001", "quote": "сертифицированы по ISO 27001"},
+            {"fact": "Без цитаты", "quote": ""},
+            "не словарь",
+        ],
+        site_text,
+    )
+    check("подтверждённый факт остался", verified == ["Продукт LeakSPY"], str(verified))
+    check("неподтверждённые отброшены", dropped == 3, str(dropped))
+    check("схема требует факты с цитатами",
+          set(dossier.CLASSIFY_SCHEMA["properties"]["facts"]["items"]["required"])
+          == {"fact", "quote"})
+    check("промпт классификатора требует дословную цитату",
+          "дословный кусок текста сайта" in dossier.load_prompt("classify.md"))
+
+    print("\n[24] Каркас письма: структура задана жёстко")
+    frame = compose.load_prompt("letter.md")
+    check("в каркасе есть приветствие", "Здравствуйте." in frame)
+    check("в каркасе есть подпись", "Михаил" in frame)
+    check("вопрос запрещено переписывать",
+          "слово в слово" in frame)
+    check("запрещён пересказ того, что адресат знает сам",
+          "не пересказывай то, что адресат знает сам" in frame.lower())
+    check("запрещено копировать формулировку про систему",
+          "Не копируй формулировки из этой инструкции" in frame)
+    check("запрещено упоминать деньги компании",
+          "о деньгах компании в письме нет ни слова" in frame.lower())
+    check("строчные буквы разрешены только в теме",
+          "На текст письма это не распространяется" in frame)
+
     print("\n[20] Сквозной прогон: досье → письмо → утренний список")
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -582,25 +668,47 @@ def main() -> int:
             "'info@alta.ru','62.01','Разработка ПО',88,310e6,243e6,27.5,'passed','t',"
             "'https://alta.ru','product',0.92,'Софт для таможенного оформления',"
             "'[\"таможня\", \"ВЭД\"]','t')")
-        # Вторая компания — с пустым досье. На ней проверяем, что письмо
-        # без фактов до утреннего списка не доходит.
+        conn.execute(
+            "UPDATE companies SET site_facts = ? WHERE inn = '7701'",
+            (json.dumps(["Продукт «Альта-ГТД» для подачи деклараций",
+                         "Обучение декларантов в собственном учебном центре",
+                         "Сервис выдачи электронных подписей"],
+                        ensure_ascii=False),))
+        # Вторая: факты в досье есть, но письмо получилось общим и ни одного
+        # из них не использовало. Проверяем, что это ловится сверкой текста,
+        # а не самоотчётом модели.
         conn.execute(
             "INSERT INTO companies (inn,name,first_seen,last_seen,region,"
             "okved,okved_name,staff,revenue,icp_status,checked_at,site_url,"
-            "site_type,site_confidence,site_summary,site_checked_at) "
-            "VALUES ('7702','ООО \"ПУСТО\"','t','t','Москва','62.01',"
+            "site_type,site_confidence,site_summary,site_facts,site_checked_at) "
+            "VALUES ('7702','ООО \"ОБЩЕЕ\"','t','t','Москва','62.01',"
+            "'Разработка ПО',30,90e6,'passed','t','https://obshee.ru',"
+            "'outsourcing',0.5,'IT-компания',"
+            "'[\"Продукт ParsecNET для контроля доступа\", "
+            "\"Проекты для государственных заказчиков\"]','t')")
+        # Третья: фактов нет вовсе — модель не должна вызываться совсем.
+        conn.execute(
+            "INSERT INTO companies (inn,name,first_seen,last_seen,region,"
+            "okved,okved_name,staff,revenue,icp_status,checked_at,site_url,"
+            "site_type,site_confidence,site_summary,site_facts,site_checked_at) "
+            "VALUES ('7703','ООО \"ПУСТО\"','t','t','Москва','62.01',"
             "'Разработка ПО',30,90e6,'passed','t','https://pusto.ru',"
-            "'outsourcing',0.5,'IT-компания','t')")
+            "'outsourcing',0.5,'IT-компания','[]','t')")
         conn.commit()
         row = conn.execute("SELECT * FROM companies WHERE inn='7701'").fetchone()
         dossier_text = compose.build_dossier(row)
         conn.close()
 
         check("в досье попало описание с сайта", "таможенного оформления" in dossier_text)
-        check("в досье попала выручка и динамика",
-              "310 млн" in dossier_text and "+28%" in dossier_text, dossier_text)
-        check("в досье попала выручка на сотрудника",
-              "на сотрудника: 3.5" in dossier_text, dossier_text)
+        check("в досье попали конкретные факты с сайта",
+              "Альта-ГТД" in dossier_text and "учебном центре" in dossier_text,
+              dossier_text)
+        check("факты стоят под заголовком про наблюдение",
+              dossier_text.index("НАЙДЕНО НА ИХ САЙТЕ") < dossier_text.index("Альта-ГТД"),
+              dossier_text)
+        check("выручка помечена как «в письме не упоминать»",
+              dossier_text.index("не упоминать") < dossier_text.index("310 млн"),
+              dossier_text)
         check("в досье есть запрет на выдумки",
               "Ничего сверх этого списка" in dossier_text)
 
@@ -610,21 +718,24 @@ def main() -> int:
         def fake_classify(system_prompt, user_content, schema, max_tokens=1024):
             # Ключуем по компании: иначе второй вызов затирает первый и
             # проверка «дошёл ли нужный угол» становится бессмысленной.
-            key = "пусто" if "ПУСТО" in user_content else "альта"
+            key = ("пусто" if "ПУСТО" in user_content
+                   else "общее" if "ОБЩЕЕ" in user_content else "альта")
             captured[key] = {"system": system_prompt, "user": user_content}
-            # У пустой компании модель честно не находит, на что опереться.
-            if "ПУСТО" in user_content:
+            if key == "общее":
+                # Письмо ни на что не опирается, но модель заявляет обратное.
                 return {
                     "subject": "вопрос про ваших клиентов",
-                    "body": "Вы занимаетесь разработкой...",
+                    "body": "Здравствуйте.\n\nВы занимаетесь разработкой.\n\nМихаил",
                     "why_line": "IT-компания подходящего размера",
-                    "facts_used": ["IT-компания"],
+                    "facts_used": ["Продукт ParsecNET для контроля доступа",
+                                   "Проекты для государственных заказчиков"],
                 }
             return {
-                "subject": "про ваши проекты для импортёров",
-                "body": "Вы продаёте софт для таможенного оформления...",
+                "subject": "про ваш учебный центр для декларантов",
+                "body": ("Здравствуйте.\n\nУ вас Альта-ГТД и собственный учебный "
+                         "центр, где вы обучаете декларантов.\n\nМихаил"),
                 "why_line": "продуктовая компания с чётким ICP, выручка растёт",
-                "facts_used": ["софт для таможенного оформления", "88 человек"],
+                "facts_used": ["Продукт «Альта-ГТД» для подачи деклараций"],
             }
 
         original = llm.classify
@@ -635,30 +746,49 @@ def main() -> int:
             llm.classify = original
 
         check("годное письмо написано", result["written"] == 1, str(result))
-        check("письмо без фактов отложено", result["thin"] == 1, str(result))
+        check("письма без опоры на факты отложены", result["thin"] == 2, str(result))
+        check("компания без фактов до модели не дошла",
+              "пусто" not in captured, str(sorted(captured)))
         check("модель получила угол для продуктовой компании",
               "кто покупатель" in captured.get("альта", {}).get("system", ""))
         check("аутсорсеру ушёл другой угол",
-              "специализацию" in captured.get("пусто", {}).get("system", ""))
+              "специализацию" in captured.get("общее", {}).get("system", ""))
         check("модель получила факты из досье",
-              "таможенного оформления" in captured.get("альта", {}).get("user", ""))
+              "учебном центре" in captured.get("альта", {}).get("user", ""))
         check("модель получила требование не выдумывать",
               "Ничего не выдумывай" in captured.get("альта", {}).get("system", ""))
+
+        # Самое важное в этом разделе: модель заявила два факта, в тексте
+        # не оказалось ни одного — и письмо всё равно отложено.
+        conn = db.connect()
+        общее = conn.execute("SELECT letter_status, letter_facts FROM companies "
+                             "WHERE inn = '7702'").fetchone()
+        альта = conn.execute("SELECT letter_facts FROM companies "
+                             "WHERE inn = '7701'").fetchone()
+        conn.close()
+        check("самоотчёт модели не спасает пустое письмо",
+              общее["letter_status"] == "thin", str(общее["letter_status"]))
+        check("в базе сохранены сверенные факты, а не заявленные",
+              json.loads(общее["letter_facts"]) == [], общее["letter_facts"])
+        check("у годного письма факты найдены сверкой",
+              len(json.loads(альта["letter_facts"])) == 2, альта["letter_facts"])
 
         path = report.build_morning(icp_full)
         check("утренний список создан", path is not None and path.exists())
         if path:
             text = path.read_text(encoding="utf-8")
             check("в списке есть строка «Почему здесь»", "**Почему здесь:**" in text)
-            check("в списке есть тема письма", "про ваши проекты для импортёров" in text)
-            check("в списке есть текст письма", "софт для таможенного оформления" in text)
+            check("в списке есть тема письма", "учебный центр для декларантов" in text)
+            check("в списке есть текст письма", "Альта-ГТД" in text)
             check("в списке указан тип компании", "продуктовая компания" in text)
             check("напоминание не хранить ФИО на месте",
                   "система не хранит" in text)
-            check("письмо без фактов в основной список не попало",
+            check("письмо без опоры на факты в основной список не попало",
                   "Вы занимаетесь разработкой" not in text, text)
-            check("отложенная компания названа в хвосте",
-                  "Отложено" in text and "ПУСТО" in text, text)
+            check("отложенные компании названы в хвосте",
+                  "Отложено" in text and "ОБЩЕЕ" in text and "ПУСТО" in text, text)
+            check("общий адрес показан без предупреждения",
+                  "`info@alta.ru`" in text and "info@alta.ru — ⚠️" not in text, text)
 
         check("повторный список пуст", report.build_morning(icp_full) is None)
 
