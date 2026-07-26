@@ -430,13 +430,32 @@ def main() -> int:
 
     print("\n[14] Вердикт по ICP: ступень 2 (финансы)")
     ok, _ = targets.judge_finances({"revenue": 120_000_000.0,
-                                    "revenue_change_pct": -15.0}, criteria)
+                                    "revenue_change_pct": -15.0}, criteria, staff=40)
     check("подходящая выручка проходит", ok is True)
-    ok, _ = targets.judge_finances({"revenue": 1_000_000.0}, criteria)
+    ok, _ = targets.judge_finances({"revenue": 1_000_000.0}, criteria, staff=40)
     check("слишком малая выручка отсеивается", ok is False)
-    ok, reason = targets.judge_finances({}, criteria)
+    ok, reason = targets.judge_finances({}, criteria, staff=40)
     check("нет данных о выручке → отказ", ok is False)
     check("причина названа", "выручк" in reason, reason)
+
+    # Выручка на сотрудника отделяет разработку от перепродажи железа.
+    # Реальный случай из первого прогона: «ЭЛЕТЕК», 865 млн при штате до 100.
+    ok, reason = targets.judge_finances({"revenue": 865_000_000.0}, criteria, staff=100)
+    check("перепродажа отсеивается по выручке на сотрудника", ok is False)
+    check("причина объясняет, почему", "перепродаж" in reason, reason)
+
+    ok, reason = targets.judge_finances({"revenue": 120_000_000.0}, criteria, staff=40)
+    check("типичный аутсорс проходит (3 млн на человека)", ok is True, reason)
+    check("выручка на сотрудника попала в описание",
+          "на сотрудника" in reason, reason)
+
+    ok, _ = targets.judge_finances({"revenue": 120_000_000.0}, criteria, staff=None)
+    check("без данных о штате проверка на сотрудника пропускается", ok is True)
+
+    print("\n[14b] Формулировка динамики")
+    check("динамика около нуля не даёт «-0%»",
+          "0%" not in targets.describe_signal(-0.1, scoring)[1],
+          targets.describe_signal(-0.1, scoring)[1])
 
     print("\n[15] Бюджет запросов")
     budget = RequestBudget(limit=3)

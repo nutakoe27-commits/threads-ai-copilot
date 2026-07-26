@@ -76,7 +76,8 @@ def judge_profile(company: dict[str, Any], criteria: dict[str, Any]) -> tuple[bo
     return True, f"профиль подходит: ОКВЭД {company.get('okved')}, штат {staff:.0f}"
 
 
-def judge_finances(finances: dict[str, Any], criteria: dict[str, Any]) -> tuple[bool, str]:
+def judge_finances(finances: dict[str, Any], criteria: dict[str, Any],
+                   staff: float | None = None) -> tuple[bool, str]:
     """Ступень 2: выручка. Запрашивается только для прошедших ступень 1."""
     revenue = finances.get("revenue")
     revenue_min, revenue_max = criteria.get("revenue_min"), criteria.get("revenue_max")
@@ -88,10 +89,30 @@ def judge_finances(finances: dict[str, Any], criteria: dict[str, Any]) -> tuple[
     if revenue_max is not None and revenue > revenue_max:
         return False, f"выручка {revenue / 1e6:.1f} млн больше порога"
 
+    # Выручка на сотрудника отделяет разработку на заказ от перепродажи
+    # железа и лицензий, которые прячутся под тем же ОКВЭД 62.01.
+    per_employee: float | None = None
+    if staff:
+        per_employee = revenue / staff
+        low = criteria.get("revenue_per_employee_min")
+        high = criteria.get("revenue_per_employee_max")
+        if low is not None and per_employee < low:
+            return False, (f"выручка на сотрудника {per_employee / 1e6:.1f} млн — "
+                           f"слишком мало для разработки")
+        if high is not None and per_employee > high:
+            return False, (f"выручка на сотрудника {per_employee / 1e6:.1f} млн — "
+                           f"похоже на перепродажу, а не разработку")
+
+    parts = [f"выручка {revenue / 1e6:.1f} млн"]
+    if per_employee:
+        parts.append(f"{per_employee / 1e6:.1f} млн на сотрудника")
+
     change = finances.get("revenue_change_pct")
     if change is None:
-        return True, f"выручка {revenue / 1e6:.1f} млн, динамика неизвестна"
-    return True, f"выручка {revenue / 1e6:.1f} млн, динамика {change:+.1f}%"
+        parts.append("динамика неизвестна")
+    else:
+        parts.append(f"динамика {change:+.1f}%")
+    return True, ", ".join(parts)
 
 
 def describe_signal(change_pct: float | None, scoring: dict[str, Any]) -> tuple[str, str]:
@@ -110,7 +131,11 @@ def describe_signal(change_pct: float | None, scoring: dict[str, Any]) -> tuple[
     if change_pct <= strong_decline:
         return "strong", f"выручка упала на {abs(change_pct):.0f}% год к году"
     if flat_from < change_pct <= flat_to:
-        return "strong", f"выручка стоит на месте ({change_pct:+.0f}% год к году)"
+        # Округление до целых даёт уродливое «-0%», поэтому near-zero
+        # описываем словами, а не числом.
+        if abs(change_pct) < 1:
+            return "strong", "выручка не изменилась год к году"
+        return "strong", f"выручка почти не изменилась ({change_pct:+.0f}% год к году)"
     return "normal", f"выручка выросла на {change_pct:.0f}% год к году"
 
 
@@ -303,7 +328,7 @@ def enrich(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
                 finances = {}
 
             fields.update(finances)
-            ok, fin_reason = judge_finances(finances, criteria)
+            ok, fin_reason = judge_finances(finances, criteria, company.get("staff"))
             status = "passed" if ok else "rejected"
             counters[status] += 1
 
