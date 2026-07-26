@@ -106,6 +106,8 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
         conn.close()
         return {"checked": 0}
 
+    target_types = site_cfg.get("target_types") or ["outsourcing", "staffing"]
+
     fetcher = WebsiteFetcher(site_cfg)
     counters = {"checked": 0, "no_site": 0, "unreachable": 0, "classified": 0}
     by_type: dict[str, int] = {}
@@ -153,7 +155,7 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
         by_type[site_type] = by_type.get(site_type, 0) + 1
 
         logger.info("%s %s — %s (уверенность %.0f%%): %s",
-                    "✓" if site_type in ("outsourcing", "staffing") else "·",
+                    "✓" if site_type in target_types else "·",
                     name, TYPE_LABELS.get(site_type, site_type),
                     float(verdict.get("confidence", 0)) * 100,
                     verdict.get("summary", ""))
@@ -180,9 +182,10 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
         logger.info("--- Кто это оказался:")
         for site_type, count in sorted(by_type.items(), key=lambda x: -x[1]):
             logger.info("      %3d  %s", count, TYPE_LABELS.get(site_type, site_type))
-        target = by_type.get("outsourcing", 0) + by_type.get("staffing", 0)
-        logger.info("Ваш ICP (разработка на заказ + аутстафф): %d из %d",
-                    target, counters["classified"])
+        target = sum(by_type.get(t, 0) for t in target_types)
+        labels = ", ".join(TYPE_LABELS.get(t, t) for t in target_types)
+        logger.info("Подходят для письма (%s): %d из %d",
+                    labels, target, counters["classified"])
     return counters
 
 

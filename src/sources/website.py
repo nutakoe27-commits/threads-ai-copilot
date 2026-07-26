@@ -130,6 +130,44 @@ class WebsiteFetcher:
             pass
         return parser, delay
 
+    @staticmethod
+    def _variants(base_url: str) -> list[str]:
+        """Варианты адреса на случай, если в ЕГРЮЛ записан не тот.
+
+        В реестре часто лежит адрес десятилетней давности: без www, когда
+        сайт только с www, или http, когда давно только https. Пробуем
+        несколько написаний, прежде чем признать сайт недоступным.
+        """
+        parsed = urlparse(base_url)
+        host = parsed.netloc
+        hosts = [host]
+        if host.startswith("www."):
+            hosts.append(host[4:])
+        else:
+            hosts.append("www." + host)
+
+        variants = []
+        for scheme in ("https", "http"):
+            for candidate in hosts:
+                url = f"{scheme}://{candidate}"
+                if url not in variants:
+                    variants.append(url)
+        return variants
+
+    def _reachable_base(self, base_url: str) -> str | None:
+        """Находит первый вариант адреса, который вообще отвечает."""
+        for candidate in self._variants(base_url):
+            try:
+                response = self.session.get(candidate, timeout=self.timeout, stream=True)
+                response.close()
+                if response.status_code < 400:
+                    if candidate != base_url:
+                        logger.debug("Адрес из реестра не открылся, помог вариант %s", candidate)
+                    return candidate
+            except requests.RequestException:
+                continue
+        return None
+
     def fetch(self, raw_url: str) -> dict[str, Any]:
         """Собирает текст с нескольких страниц сайта.
 
@@ -140,6 +178,12 @@ class WebsiteFetcher:
         base_url = normalize_url(raw_url)
         if not base_url:
             return {"ok": False, "reason": "некорректный адрес сайта", "text": "", "pages": []}
+
+        reachable = self._reachable_base(base_url)
+        if not reachable:
+            return {"ok": False, "reason": "сайт не отвечает ни по одному варианту адреса",
+                    "text": "", "pages": []}
+        base_url = reachable
 
         robots, delay = self._robots(base_url)
         collected: list[str] = []
@@ -183,7 +227,12 @@ class WebsiteFetcher:
                 visited.append(url)
 
         if not collected:
-            return {"ok": False, "reason": "не удалось прочитать ни одной страницы",
+            # Частый случай — сайт собран на JavaScript: сервер отдаёт пустой
+            # каркас, а текст дорисовывается в браузере. Читать такие мы не
+            # умеем и не будем: headless-браузер сильно усложнит систему.
+            return {"ok": False,
+                    "reason": "страницы открылись, но текста нет "
+                              "(вероятно, сайт собирается скриптами в браузере)",
                     "text": "", "pages": []}
 
         combined = " ".join(collected)[:MAX_TEXT_CHARS]

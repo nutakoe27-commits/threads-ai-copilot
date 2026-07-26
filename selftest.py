@@ -23,7 +23,7 @@ import yaml
 from src import collect, db, dossier, log, report, targets
 from src.providers.checko import CheckoClient, RequestBudget, deep_pick, to_number
 from src.sources import trudvsem as trudvsem_module
-from src.sources.website import _TextExtractor, normalize_url
+from src.sources.website import _TextExtractor, WebsiteFetcher, normalize_url
 from src.sources.trudvsem import TrudvsemClient, TrudvsemError
 
 FAILURES: list[str] = []
@@ -484,6 +484,17 @@ def main() -> int:
           "var x" not in text and "color:red" not in text, text)
     check("видимый текст собран", "Разработка на заказ" in text, text)
     check("пробелы схлопнуты", "проекты под ключ" in text, text)
+
+    variants = WebsiteFetcher._variants("https://example.ru")
+    check("пробуем и www, и без www",
+          "https://www.example.ru" in variants and "https://example.ru" in variants,
+          str(variants))
+    check("пробуем и https, и http",
+          "http://example.ru" in variants, str(variants))
+    check("исходный адрес идёт первым", variants[0] == "https://example.ru")
+    check("вариантов не больше четырёх", len(variants) == 4, str(len(variants)))
+    check("www-адрес не удваивается",
+          WebsiteFetcher._variants("https://www.example.ru")[1] == "https://example.ru")
 
     print("\n[17] Классификация: схема и промпт")
     schema_types = set(dossier.CLASSIFY_SCHEMA["properties"]["type"]["enum"])
