@@ -19,7 +19,8 @@ from pathlib import Path
 
 import yaml
 
-from src import collect, db, log, report
+from src import collect, db, log, report, targets
+from src.providers.checko import CheckoClient, RequestBudget, deep_pick, to_number
 from src.sources import trudvsem as trudvsem_module
 from src.sources.trudvsem import TrudvsemClient, TrudvsemError
 
@@ -305,6 +306,56 @@ def main() -> int:
         check(f"отсеивается: {why}",
               collect.match_keywords(job, "активные продажи, формирование базы", keywords) is None,
               f"«{job}» всё ещё проходит")
+
+    print("\n[10] Checko: рекурсивный поиск полей в ответе")
+    # Ответ приходит на русских ключах и с неизвестной вложенностью,
+    # поэтому разбор должен находить поле на любой глубине.
+    nested = {"data": {"Реквизиты": {"ИНН": "7736207543"},
+                       "ОКВЭД": {"Код": "62.01", "Наим": "Разработка ПО"},
+                       "Показатели": {"СЧР": 45, "Выручка": "120 000 000,50"}}}
+    check("ИНН найден во вложенном словаре", deep_pick(nested, "ИНН", "inn") == "7736207543")
+    check("приоритет у первого имени из списка",
+          deep_pick({"a": {"inn": "2"}, "ИНН": "1"}, "ИНН", "inn") == "1")
+    check("число с пробелами и запятой разобрано",
+          to_number("120 000 000,50") == 120000000.5)
+    check("пустая строка не считается значением",
+          deep_pick({"ИНН": "", "x": {"ИНН": "77"}}, "ИНН") == "77")
+
+    parsed_company = CheckoClient.parse_company(nested)
+    check("из карточки извлечён ОКВЭД", parsed_company["okved"] == "62.01")
+    check("из карточки извлечена численность", parsed_company["staff"] == 45.0)
+    check("из карточки извлечена выручка", parsed_company["revenue"] == 120000000.5)
+
+    print("\n[11] Вердикт по ICP")
+    criteria = yaml.safe_load(Path("config/icp.yaml").read_text(encoding="utf-8"))["criteria"]
+    fits = {"okved": "62.01", "extra_okved": [], "staff": 40.0,
+            "revenue": 120_000_000.0, "registration_date": "2015-03-10"}
+
+    status, _ = targets.judge(fits, criteria)
+    check("подходящая компания проходит", status == "passed", status)
+
+    status, reason = targets.judge({**fits, "staff": 5.0}, criteria)
+    check("мелкая компания отсеивается по штату", status == "rejected")
+    check("причина отказа человекочитаема", "штат" in reason, reason)
+
+    status, _ = targets.judge({**fits, "staff": 500.0}, criteria)
+    check("крупная компания отсеивается по штату", status == "rejected")
+
+    status, _ = targets.judge({**fits, "revenue": 1_000_000.0}, criteria)
+    check("компания без выручки отсеивается", status == "rejected")
+
+    status, reason = targets.judge({**fits, "extra_okved": ["78.10"]}, criteria)
+    check("кадровое агентство отсеивается по доп. ОКВЭД", status == "rejected")
+    check("причина называет ОКВЭД", "78.10" in reason, reason)
+
+    status, _ = targets.judge({**fits, "staff": None}, criteria)
+    check("нет данных о штате → отказ, а не пропуск", status == "rejected")
+
+    print("\n[12] Бюджет запросов")
+    budget = RequestBudget(limit=3)
+    spent = [budget.try_spend() for _ in range(5)]
+    check("тратится ровно лимит", spent == [True, True, True, False, False], str(spent))
+    check("остаток не уходит в минус", budget.left == 0)
 
     print()
     if FAILURES:

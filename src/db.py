@@ -59,6 +59,16 @@ CREATE TABLE IF NOT EXISTS signals (
 CREATE INDEX IF NOT EXISTS idx_signals_inn ON signals(inn);
 CREATE INDEX IF NOT EXISTS idx_signals_reported ON signals(reported_at);
 
+-- Счётчик запросов к платным API по дням. Нужен, чтобы сборка целевого
+-- списка была возобновляемой: упёрлись в суточный лимит — завтра
+-- продолжим с того же места.
+CREATE TABLE IF NOT EXISTS api_usage (
+    day             TEXT NOT NULL,
+    provider        TEXT NOT NULL,
+    requests        INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, provider)
+);
+
 CREATE TABLE IF NOT EXISTS runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     stage           TEXT NOT NULL,
@@ -78,7 +88,21 @@ def now() -> str:
 
 # Колонки, добавленные после первой версии схемы. SQLite не умеет
 # "ADD COLUMN IF NOT EXISTS", поэтому проверяем наличие руками.
-MIGRATIONS = [("signals", "specialisation", "TEXT")]
+MIGRATIONS = [
+    ("signals", "specialisation", "TEXT"),
+    # Поля ICP, добавленные на Этапе 2 (проверка компании через Checko).
+    ("companies", "okved", "TEXT"),
+    ("companies", "okved_name", "TEXT"),
+    ("companies", "staff", "REAL"),
+    ("companies", "revenue", "REAL"),
+    ("companies", "revenue_prev", "REAL"),
+    ("companies", "revenue_change_pct", "REAL"),
+    ("companies", "registration_date", "TEXT"),
+    # candidate → passed | rejected. Пока NULL — компания не проверена.
+    ("companies", "icp_status", "TEXT"),
+    ("companies", "icp_reason", "TEXT"),
+    ("companies", "checked_at", "TEXT"),
+]
 
 
 def connect(path: Path | None = None) -> sqlite3.Connection:
@@ -196,6 +220,106 @@ def mark_reported(conn: sqlite3.Connection, signal_ids: Iterable[int], inns: Ite
     inn_rows = [(ts, inn) for inn in set(inns)]
     if inn_rows:
         conn.executemany("UPDATE companies SET last_reported = ? WHERE inn = ?", inn_rows)
+
+
+def requests_spent_today(conn: sqlite3.Connection, provider: str) -> int:
+    """Сколько запросов к провайдеру уже потрачено сегодня."""
+    day = datetime.now(timezone.utc).date().isoformat()
+    row = conn.execute(
+        "SELECT requests FROM api_usage WHERE day = ? AND provider = ?", (day, provider)
+    ).fetchone()
+    return int(row["requests"]) if row else 0
+
+
+def record_requests(conn: sqlite3.Connection, provider: str, count: int) -> None:
+    """Записывает израсходованные запросы. Вызывать в конце прогона."""
+    if count <= 0:
+        return
+    day = datetime.now(timezone.utc).date().isoformat()
+    conn.execute(
+        """
+        INSERT INTO api_usage (day, provider, requests) VALUES (?, ?, ?)
+        ON CONFLICT(day, provider) DO UPDATE SET requests = requests + excluded.requests
+        """,
+        (day, provider, count),
+    )
+
+
+def add_candidate(conn: sqlite3.Connection, inn: str, name: str, region: str) -> bool:
+    """Добавляет компанию-кандидата. False — если она уже известна."""
+    ts = now()
+    cur = conn.execute(
+        """
+        INSERT INTO companies (inn, name, region, first_seen, last_seen, status)
+        VALUES (?, ?, ?, ?, ?, 'candidate')
+        ON CONFLICT(inn) DO NOTHING
+        """,
+        (inn, name, region, ts, ts),
+    )
+    return cur.rowcount > 0
+
+
+def unchecked_candidates(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
+    """Кандидаты, по которым ещё не запрашивали карточку в Checko."""
+    return conn.execute(
+        """
+        SELECT inn, name FROM companies
+        WHERE checked_at IS NULL
+        ORDER BY first_seen
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+
+def save_icp_verdict(conn: sqlite3.Connection, inn: str, fields: dict[str, Any],
+                     status: str, reason: str) -> None:
+    """Сохраняет данные карточки и вердикт по ICP."""
+    conn.execute(
+        """
+        UPDATE companies SET
+            name = COALESCE(NULLIF(:name, ''), name),
+            site = COALESCE(NULLIF(:site, ''), site),
+            region = COALESCE(NULLIF(:region, ''), region),
+            contact_email = COALESCE(NULLIF(:email, ''), contact_email),
+            contact_phone = COALESCE(NULLIF(:phone, ''), contact_phone),
+            okved = :okved, okved_name = :okved_name,
+            staff = :staff, revenue = :revenue,
+            revenue_prev = :revenue_prev, revenue_change_pct = :revenue_change_pct,
+            registration_date = :registration_date,
+            icp_status = :status, icp_reason = :reason, checked_at = :ts
+        WHERE inn = :inn
+        """,
+        {
+            "inn": inn,
+            "name": fields.get("name") or "",
+            "site": fields.get("site") or "",
+            "region": fields.get("region") or "",
+            "email": fields.get("email") or "",
+            "phone": fields.get("phone") or "",
+            "okved": fields.get("okved") or "",
+            "okved_name": fields.get("okved_name") or "",
+            "staff": fields.get("staff"),
+            "revenue": fields.get("revenue"),
+            "revenue_prev": fields.get("revenue_prev"),
+            "revenue_change_pct": fields.get("revenue_change_pct"),
+            "registration_date": fields.get("registration_date") or "",
+            "status": status,
+            "reason": reason,
+            "ts": now(),
+        },
+    )
+
+
+def icp_summary(conn: sqlite3.Connection) -> dict[str, int]:
+    """Сводка по целевому списку: сколько кандидатов, прошло, отсеяно."""
+    rows = conn.execute(
+        """
+        SELECT COALESCE(icp_status, 'не проверено') AS status, COUNT(*) AS count
+        FROM companies GROUP BY COALESCE(icp_status, 'не проверено')
+        """
+    ).fetchall()
+    return {row["status"]: int(row["count"]) for row in rows}
 
 
 def start_run(conn: sqlite3.Connection, stage: str) -> int:

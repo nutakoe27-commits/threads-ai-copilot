@@ -12,14 +12,34 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 import yaml
 
-from src import collect, db, log, report
+from src import collect, log, report, targets
 
-CONFIG_PATH = Path(__file__).resolve().parent / "config" / "signals.yaml"
+ROOT = Path(__file__).resolve().parent
+CONFIG_PATH = ROOT / "config" / "signals.yaml"
+ICP_CONFIG_PATH = ROOT / "config" / "icp.yaml"
+
+
+def load_env() -> None:
+    """Читает .env в переменные окружения. Без внешних зависимостей.
+
+    Уже заданные переменные окружения не перезаписываются — так удобнее
+    подменять ключи при отладке, не трогая файл.
+    """
+    env_path = ROOT / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip())
 
 
 def load_config(path: Path) -> dict:
@@ -33,8 +53,14 @@ def load_config(path: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description="GTM-система: сбор сигналов и утренний список")
     parser.add_argument(
-        "--stage", choices=["collect", "report", "all"], default="all",
-        help="какой этап запустить (по умолчанию все)",
+        "--stage",
+        choices=["targets", "discover", "enrich", "collect", "report", "all"],
+        default="all",
+        help=(
+            "targets — построить целевой список через Checko (discover + enrich); "
+            "discover/enrich — половинки этого этапа по отдельности; "
+            "collect/report — сбор сигналов и утренний список"
+        ),
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -48,17 +74,25 @@ def main() -> int:
     parser.add_argument("--config", type=Path, default=CONFIG_PATH)
     args = parser.parse_args()
 
+    load_env()
     logger = log.setup(verbose=args.verbose)
     logger.info("=" * 70)
     logger.info("Запуск: этап=%s dry_run=%s", args.stage, args.dry_run)
 
-    config = load_config(args.config)
-
     try:
+        if args.stage in ("targets", "discover", "enrich"):
+            icp_config = load_config(ICP_CONFIG_PATH)
+            if args.stage in ("targets", "discover"):
+                targets.discover(icp_config, dry_run=args.dry_run)
+            if args.stage in ("targets", "enrich"):
+                targets.enrich(icp_config, dry_run=args.dry_run)
+
         if args.stage in ("collect", "all"):
+            config = load_config(args.config)
             collect.run(config, dry_run=args.dry_run, raw=args.raw)
 
         if args.stage in ("report", "all"):
+            config = load_config(args.config)
             path = report.build(config, dry_run=args.dry_run)
             if path:
                 logger.info("Открыть список: %s", path)
