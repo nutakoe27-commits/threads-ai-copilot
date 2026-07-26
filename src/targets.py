@@ -361,6 +361,67 @@ def enrich(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
     return counters
 
 
+def rejudge(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
+    """Пересматривает вердикты по уже скачанным данным. Ноль запросов к API.
+
+    Нужно после каждой правки критериев в icp.yaml: штат, выручка и ОКВЭД
+    уже лежат в базе, платить за них второй раз незачем. Позволяет крутить
+    пороги сколько угодно, не расходуя суточный лимит.
+    """
+    criteria = config.get("criteria", {})
+    conn = db.connect()
+
+    rows = conn.execute(
+        "SELECT * FROM companies WHERE checked_at IS NOT NULL"
+    ).fetchall()
+    if not rows:
+        logger.info("Проверенных компаний пока нет — сначала запустите enrich")
+        conn.close()
+        return {"rejudged": 0, "changed": 0}
+
+    counters = {"rejudged": 0, "changed": 0, "passed": 0, "rejected": 0}
+    for row in rows:
+        company = {
+            "okved": row["okved"] or "",
+            # Дополнительные ОКВЭД в базе не храним — их проверка была на
+            # этапе enrich и повторно не выполняется.
+            "extra_okved": [],
+            "staff": row["staff"],
+            "registration_date": row["registration_date"] or "",
+            "active": True,
+        }
+        ok, reason = judge_profile(company, criteria)
+        if ok:
+            finances = {
+                "revenue": row["revenue"],
+                "revenue_change_pct": row["revenue_change_pct"],
+            }
+            ok, reason = judge_finances(finances, criteria, row["staff"])
+
+        status = "passed" if ok else "rejected"
+        counters["rejudged"] += 1
+        counters[status] += 1
+        if status != row["icp_status"]:
+            counters["changed"] += 1
+            logger.info("%s: %s → %s (%s)", row["name"], row["icp_status"], status, reason)
+
+        if not dry_run:
+            conn.execute(
+                "UPDATE companies SET icp_status = ?, icp_reason = ? WHERE inn = ?",
+                (status, reason, row["inn"]),
+            )
+
+    if not dry_run:
+        conn.commit()
+    conn.close()
+
+    logger.info("Пересмотрено %d компаний: прошло %d, отсеяно %d, изменилось решений %d. "
+                "Запросов к API потрачено: 0",
+                counters["rejudged"], counters["passed"],
+                counters["rejected"], counters["changed"])
+    return counters
+
+
 def run(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
     """Полный проход этапа: сначала добрать кандидатов, потом проверить."""
     discover(config, dry_run=dry_run)

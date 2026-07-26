@@ -54,11 +54,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="GTM-система: сбор сигналов и утренний список")
     parser.add_argument(
         "--stage",
-        choices=["targets", "discover", "enrich", "collect", "report", "all"],
+        choices=["targets", "discover", "enrich", "rejudge", "collect", "report", "all"],
         default="all",
         help=(
             "targets — построить целевой список через Checko (discover + enrich); "
             "discover/enrich — половинки этого этапа по отдельности; "
+            "rejudge — пересмотреть вердикты по уже скачанным данным, без запросов к API; "
             "collect/report — сбор сигналов и утренний список"
         ),
     )
@@ -80,12 +81,15 @@ def main() -> int:
     logger.info("Запуск: этап=%s dry_run=%s", args.stage, args.dry_run)
 
     try:
-        if args.stage in ("targets", "discover", "enrich"):
+        if args.stage in ("targets", "discover", "enrich", "rejudge"):
             icp_config = load_config(ICP_CONFIG_PATH)
-            if args.stage in ("targets", "discover"):
-                targets.discover(icp_config, dry_run=args.dry_run)
-            if args.stage in ("targets", "enrich"):
-                targets.enrich(icp_config, dry_run=args.dry_run)
+            if args.stage == "rejudge":
+                targets.rejudge(icp_config, dry_run=args.dry_run)
+            else:
+                if args.stage in ("targets", "discover"):
+                    targets.discover(icp_config, dry_run=args.dry_run)
+                if args.stage in ("targets", "enrich"):
+                    targets.enrich(icp_config, dry_run=args.dry_run)
 
         if args.stage in ("collect", "all"):
             config = load_config(args.config)
