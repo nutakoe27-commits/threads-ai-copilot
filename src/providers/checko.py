@@ -160,38 +160,31 @@ class CheckoClient:
 
     @staticmethod
     def parse_search_results(payload: dict[str, Any]) -> list[dict[str, str]]:
-        """Достаёт из ответа поиска пары ИНН + название.
+        """Достаёт из ответа поиска то немногое, что нам нужно.
 
-        Структура ответа неизвестна заранее, поэтому идём от списка: находим
-        первый список словарей, в которых есть что-то похожее на ИНН.
+        Берём ровно четыре поля: ИНН, название, дату регистрации и статус.
+        Дата и статус позволяют отсеять часть компаний **бесплатно**, не
+        тратя запрос на карточку.
+
+        ВАЖНО: записи поиска содержат блоки «Руковод» и «Учред» с ФИО и ИНН
+        физлиц. Мы их не читаем и не сохраняем — см. DECISIONS.md, Р-000.
         """
-        def find_records(node: Any) -> list[dict[str, Any]]:
-            if isinstance(node, list):
-                records = [item for item in node
-                           if isinstance(item, dict) and deep_pick(item, "ИНН", "inn")]
-                if records:
-                    return records
-                for item in node:
-                    found = find_records(item)
-                    if found:
-                        return found
-            elif isinstance(node, dict):
-                for value in node.values():
-                    found = find_records(value)
-                    if found:
-                        return found
-            return []
+        data = payload.get("data") or {}
+        records = data.get("Записи") or []
 
         results = []
-        for record in find_records(payload):
-            inn = str(deep_pick(record, "ИНН", "inn") or "").strip()
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            inn = str(record.get("ИНН") or "").strip()
             if not inn:
                 continue
-            name = str(
-                deep_pick(record, "НаимСокрЮЛ", "НаимСокр", "НаимПолн", "Наим", "name")
-                or ""
-            ).strip()
-            results.append({"inn": inn, "name": name})
+            results.append({
+                "inn": inn,
+                "name": str(record.get("НаимСокр") or record.get("НаимПолн") or "").strip(),
+                "reg_date": str(record.get("ДатаРег") or "").strip(),
+                "status": str(record.get("Статус") or "").strip(),
+            })
         return results
 
     def iter_candidates(self, okved: str, region_code: str, region_name: str,

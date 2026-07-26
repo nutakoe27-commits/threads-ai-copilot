@@ -330,10 +330,14 @@ def main() -> int:
     check("взят ИНН юрлица, а не руководителя",
           records[0]["inn"] == "3203006518", records[0]["inn"])
     check("название компании извлечено", records[0]["name"] == 'ООО "АНАНТА"')
+    check("дата регистрации взята из поиска (бесплатный отсев по возрасту)",
+          records[0]["reg_date"] == "1999-07-30")
+    check("статус взят из поиска (бесплатный отсев недействующих)",
+          records[0]["status"] == "Действует")
 
     # Требование Р-000: персональные данные в систему не попадают.
     leaked = [key for record in records for key in record
-              if key not in ("inn", "name")]
+              if key not in ("inn", "name", "reg_date", "status")]
     check("из поиска не утекли ФИО и прочие поля", not leaked, str(leaked))
     check("ФИО отсутствуют в результате целиком",
           "Шульгин" not in json.dumps(records, ensure_ascii=False))

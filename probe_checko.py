@@ -127,14 +127,24 @@ def main() -> int:
         parsed = CheckoClient.parse_company(payload)
         show("ЧТО ИЗ ЭТОГО ИЗВЛЁК НАШ РАЗБОР", parsed)
 
-        missing = [name for name, value in parsed.items()
-                   if value in (None, "", []) and name not in ("extra_okved", "msp_category")]
+        # Часть полей у конкретной компании может быть пуста по-настоящему:
+        # не у каждого юрлица в ЕГРЮЛ есть сайт или почта. Ошибкой считаем
+        # только отсутствие того, без чего не проверить ICP.
+        required = ("inn", "okved", "staff", "registration_date")
+        optional = ("site", "email", "phone", "msp_category", "taxes_paid", "extra_okved")
+
+        missing = [name for name in required if parsed.get(name) in (None, "")]
+        empty_optional = [name for name in optional if parsed.get(name) in (None, "", [])]
+
         if missing:
-            print(f"\n⚠️  Не заполнены поля: {', '.join(missing)}")
+            print(f"\n⚠️  Не извлеклись обязательные поля: {', '.join(missing)}")
             print("   Найдите их реальные имена в ответе выше и допишите в")
             print("   src/providers/checko.py → parse_company()")
         else:
-            print("\n✓ Все поля карточки извлечены")
+            print("\n✓ Все обязательные поля карточки извлечены")
+        if empty_optional:
+            print(f"   (пусты необязательные: {', '.join(empty_optional)} — "
+                  f"скорее всего, их просто нет у этой компании)")
     except Exception as exc:  # noqa: BLE001
         print(f"Карточка не получена: {exc}", file=sys.stderr)
 

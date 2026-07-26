@@ -118,8 +118,11 @@ def discover(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
     """Проход 1: набрать буфер кандидатов, запомнив, где остановились."""
     provider_cfg = config.get("provider", {})
     target_cfg = config.get("target_list", {})
+    criteria = config.get("criteria", {})
     buffer_target = int(provider_cfg.get("candidate_buffer", 500))
     max_search_requests = int(provider_cfg.get("discover_per_run", 10))
+    start_fraction = float(target_cfg.get("start_page_fraction", 0.0))
+    min_age = criteria.get("min_age_years")
 
     conn = db.connect()
     spent_today = db.requests_spent_today(conn, PROVIDER)
@@ -129,7 +132,8 @@ def discover(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
     logger.info("Непроверенных кандидатов в буфере: %d (цель %d). "
                 "Бюджет запросов сегодня: осталось %d", buffered, buffer_target, budget.left)
 
-    counters = {"found": 0, "new": 0, "requests": 0}
+    counters = {"found": 0, "new": 0, "requests": 0,
+                "skipped_inactive": 0, "skipped_young": 0}
     if buffered >= buffer_target:
         logger.info("Буфер полон, поиск не нужен — сразу к проверке")
         conn.close()
@@ -152,6 +156,18 @@ def discover(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
                 if cursor and cursor["exhausted"]:
                     continue
                 page = int(cursor["next_page"]) if cursor else 1
+                known_total = int(cursor["total_pages"]) if cursor and cursor["total_pages"] \
+                    else None
+
+                # Выдача отсортирована по ОГРН, а в ОГРН зашит год регистрации.
+                # Поэтому первые страницы — это компании 90-х и начала 2000-х,
+                # среди которых много спящих пустышек. Начинаем не с начала,
+                # а со страницы, где регистрации уже ближе к нашему времени.
+                if known_total and page == 1 and start_fraction > 0:
+                    page = max(1, int(known_total * start_fraction))
+                    logger.info("ОКВЭД %s / %s: стартуем со страницы %d из %d "
+                                "(ранние страницы — компании 90-х)",
+                                okved, region["name"], page, known_total)
 
                 try:
                     payload = client.search_by_okved(
@@ -173,6 +189,17 @@ def discover(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
 
                 for record in records:
                     counters["found"] += 1
+
+                    # Бесплатные отсевы: статус и возраст видны прямо в выдаче
+                    # поиска, тратить на них запрос карточки не нужно.
+                    if record["status"] and not record["status"].lower().startswith("действ"):
+                        counters["skipped_inactive"] += 1
+                        continue
+                    age = _years_since(record["reg_date"])
+                    if min_age is not None and age is not None and age < min_age:
+                        counters["skipped_young"] += 1
+                        continue
+
                     if dry_run:
                         continue
                     if db.add_candidate(conn, record["inn"], record["name"], region["name"]):
@@ -180,8 +207,17 @@ def discover(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
                         buffered += 1
 
                 exhausted = not records or (total_pages is not None and page >= total_pages)
+
+                # На самом первом запросе мы ещё не знали, сколько всего
+                # страниц, поэтому взяли первую. Теперь знаем — и следующий
+                # прогон должен начать не со второй страницы, а сразу
+                # с нужной доли списка.
+                next_page = page + 1
+                if page == 1 and total_pages and start_fraction > 0:
+                    next_page = max(2, int(total_pages * start_fraction))
+
                 if not dry_run:
-                    db.save_cursor(conn, okved, region["code"], page + 1, total_pages, exhausted)
+                    db.save_cursor(conn, okved, region["code"], next_page, total_pages, exhausted)
                     conn.commit()
     except BudgetExhausted as exc:
         logger.warning("%s", exc)
@@ -191,8 +227,12 @@ def discover(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
         conn.commit()
     conn.close()
 
-    logger.info("Поиск: страниц запрошено %d, найдено %d, новых кандидатов %d",
-                counters["requests"], counters["found"], counters["new"])
+    logger.info(
+        "Поиск: страниц запрошено %d, найдено %d, новых кандидатов %d "
+        "(бесплатно отсеяно: недействующих %d, слишком молодых %d)",
+        counters["requests"], counters["found"], counters["new"],
+        counters["skipped_inactive"], counters["skipped_young"],
+    )
     return counters
 
 
