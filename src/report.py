@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import urllib.parse
 from collections import defaultdict
 from datetime import date
@@ -157,4 +158,146 @@ def build(config: dict[str, Any], dry_run: bool = False) -> Path | None:
     conn.close()
 
     logger.info("Утренний список готов: %s (%d компаний)", path, len(ordered))
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Утренний список по целевым компаниям (Этап 3).
+# Отличается от списка выше тем, что строится не от вакансии-сигнала,
+# а от компании с готовым письмом.
+# ---------------------------------------------------------------------------
+
+TYPE_LABELS = {
+    "outsourcing": "разработка на заказ",
+    "staffing": "аутстафф команд",
+    "product": "продуктовая компания",
+    "integrator": "системный интегратор",
+    "not_it": "не про IT",
+    "unknown": "тип не определён",
+}
+
+
+def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
+    """Утренний список: компания, строка «почему», готовое письмо."""
+    site_cfg = config.get("website", {})
+    target_types = site_cfg.get("target_types") or ["outsourcing", "staffing"]
+    limit = int(config.get("report", {}).get("max_companies", 20))
+
+    conn = db.connect()
+    placeholders = ",".join("?" for _ in target_types)
+    rows = conn.execute(
+        f"""
+        SELECT * FROM companies
+        WHERE letter_body IS NOT NULL
+          AND site_type IN ({placeholders})
+          AND last_reported IS NULL
+        ORDER BY
+            -- Продуктовые компании первыми: у них ICP острее, и система
+            -- показывает себя на них лучше всего (DECISIONS.md, Р-020).
+            CASE WHEN site_type = 'product' THEN 0 ELSE 1 END,
+            CASE WHEN revenue_change_pct IS NULL THEN 1 ELSE 0 END,
+            revenue_change_pct
+        LIMIT ?
+        """,
+        (*target_types, limit),
+    ).fetchall()
+
+    if not rows:
+        logger.warning("Нет компаний с готовыми письмами. "
+                       "Порядок: --stage targets, --stage dossier, --stage compose")
+        conn.close()
+        return None
+
+    today = date.today().isoformat()
+    lines: list[str] = [
+        f"# Утренний список — {today}",
+        "",
+        f"Компаний: **{len(rows)}**. Каждое письмо прочитайте и поправьте перед отправкой.",
+        "",
+        "> Имя и должность получателя система не хранит и не подставляет — "
+        "добавьте руками в почтовом клиенте.",
+        "",
+        "---",
+        "",
+    ]
+
+    for index, row in enumerate(rows, start=1):
+        thin = False
+        try:
+            facts = json.loads(row["letter_facts"] or "[]")
+            thin = len(facts) < 2
+        except (json.JSONDecodeError, TypeError):
+            facts = []
+
+        marker = "⚠️" if thin else "•"
+        lines.append(f"## {index}. {marker} {row['name']}")
+        lines.append("")
+        lines.append(f"**Почему здесь:** {row['letter_why'] or '—'}")
+        lines.append("")
+
+        details = [TYPE_LABELS.get(row["site_type"], row["site_type"] or "—")]
+        if row["staff"]:
+            details.append(f"{row['staff']:.0f} чел.")
+        if row["revenue"]:
+            money = f"{row['revenue'] / 1e6:.0f} млн ₽"
+            if row["revenue_change_pct"] is not None:
+                money += f" ({row['revenue_change_pct']:+.0f}%)"
+            details.append(money)
+        if row["region"]:
+            details.append(row["region"])
+        lines.append(" · ".join(details))
+        lines.append("")
+
+        if row["site_summary"]:
+            lines.append(f"_{row['site_summary']}_")
+            lines.append("")
+
+        contacts = []
+        if row["site_url"]:
+            contacts.append(f"[сайт]({row['site_url']})")
+        if row["contact_email"]:
+            contacts.append(f"`{row['contact_email']}`")
+        contacts.append(f"ИНН `{row['inn']}`")
+        lines.append(" · ".join(contacts))
+        lines.append("")
+
+        lines.append(f"**Тема:** {row['letter_subject'] or '—'}")
+        lines.append("")
+        lines.append("```")
+        lines.append(row["letter_body"] or "")
+        lines.append("```")
+        lines.append("")
+
+        if thin:
+            lines.append("> ⚠️ Письмо опирается меньше чем на два факта из досье — "
+                         "вероятно, получилось шаблонным. Проверьте особенно внимательно.")
+            lines.append("")
+        elif facts:
+            lines.append(f"<sub>Факты в письме: {'; '.join(facts)}</sub>")
+            lines.append("")
+
+        lines.append("---")
+        lines.append("")
+
+    problems = log.problems()
+    if problems:
+        lines.append("## ⚠️ Проблемы прогона")
+        lines.append("")
+        lines.extend(f"- {problem}" for problem in problems)
+        lines.append("")
+
+    if dry_run:
+        logger.info("[dry-run] Отчёт не сохранён. Компаний было бы: %d", len(rows))
+        conn.close()
+        return None
+
+    MORNING_DIR.mkdir(parents=True, exist_ok=True)
+    path = MORNING_DIR / f"{today}.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+    db.mark_reported(conn, [], [row["inn"] for row in rows])
+    conn.commit()
+    conn.close()
+
+    logger.info("Утренний список готов: %s (%d компаний)", path, len(rows))
     return path

@@ -89,23 +89,55 @@ def judge_finances(finances: dict[str, Any], criteria: dict[str, Any],
     if revenue_max is not None and revenue > revenue_max:
         return False, f"выручка {revenue / 1e6:.1f} млн больше порога"
 
-    # Выручка на сотрудника отделяет разработку на заказ от перепродажи
-    # железа и лицензий, которые прячутся под тем же ОКВЭД 62.01.
+    # Выручка на сотрудника решает две задачи, и это ДВА РАЗНЫХ вопроса.
+    #
+    # Сверху — отсечь перепродажу железа и лицензий, которая прячется под
+    # тем же ОКВЭД 62.01. Здесь достаточно простого потолка.
+    #
+    # Снизу — сложнее. Компания, у которой показатель всегда был низким,
+    # раздутая и низкомаржинальная: платить не будет. А компания, которая
+    # упала ниже порога за последний год, — прямо противоположный случай:
+    # у неё была нормальная экономика, есть память о том, как должно быть,
+    # и есть острая признанная боль. Это лучший адресат, а не мусор.
+    # Поэтому нижний порог сравнивается с прошлым годом, а не применяется
+    # в лоб.
     per_employee: float | None = None
+    per_employee_prev: float | None = None
+    dropped_below = False
+
     if staff:
         per_employee = revenue / staff
+        revenue_prev = finances.get("revenue_prev")
+        # Штат за прошлый год реестр не отдаёт, поэтому берём нынешний.
+        # Сравнение получается «та же команда — меньше выручки», что для
+        # нашей задачи даже точнее: команда недозагружена.
+        if revenue_prev:
+            per_employee_prev = revenue_prev / staff
+
         low = criteria.get("revenue_per_employee_min")
         high = criteria.get("revenue_per_employee_max")
-        if low is not None and per_employee < low:
-            return False, (f"выручка на сотрудника {per_employee / 1e6:.1f} млн — "
-                           f"слишком мало для разработки")
+
         if high is not None and per_employee > high:
             return False, (f"выручка на сотрудника {per_employee / 1e6:.1f} млн — "
                            f"похоже на перепродажу, а не разработку")
 
+        if low is not None and per_employee < low:
+            if per_employee_prev is not None and per_employee_prev >= low:
+                # Упала за год — оставляем и помечаем.
+                dropped_below = True
+            elif per_employee_prev is not None:
+                return False, (f"выручка на сотрудника {per_employee / 1e6:.1f} млн, "
+                               f"год назад {per_employee_prev / 1e6:.1f} млн — "
+                               f"стабильно низкая, компания раздутая")
+            else:
+                return False, (f"выручка на сотрудника {per_employee / 1e6:.1f} млн, "
+                               f"сравнить не с чем — отсеиваем на всякий случай")
+
     parts = [f"выручка {revenue / 1e6:.1f} млн"]
     if per_employee:
         parts.append(f"{per_employee / 1e6:.1f} млн на сотрудника")
+    if dropped_below and per_employee_prev:
+        parts.append(f"упала с {per_employee_prev / 1e6:.1f} млн на человека за год")
 
     change = finances.get("revenue_change_pct")
     if change is None:

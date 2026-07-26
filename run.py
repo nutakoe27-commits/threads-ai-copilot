@@ -18,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from src import collect, dossier, log, report, targets
+from src import collect, compose, dossier, log, report, targets
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config" / "signals.yaml"
@@ -55,13 +55,15 @@ def main() -> int:
     parser.add_argument(
         "--stage",
         choices=["targets", "discover", "enrich", "rejudge", "dossier",
-                 "collect", "report", "all"],
+                 "compose", "morning", "collect", "report", "all"],
         default="all",
         help=(
             "targets — построить целевой список через Checko (discover + enrich); "
             "discover/enrich — половинки этого этапа по отдельности; "
             "rejudge — пересмотреть вердикты по уже скачанным данным, без запросов к API; "
             "dossier — обойти сайты прошедших ICP и классифицировать их; "
+            "compose — написать письма по досье; "
+            "morning — собрать утренний список с письмами; "
             "collect/report — сбор сигналов и утренний список"
         ),
     )
@@ -95,6 +97,14 @@ def main() -> int:
 
         if args.stage == "dossier":
             dossier.run(load_config(ICP_CONFIG_PATH), dry_run=args.dry_run)
+
+        if args.stage == "compose":
+            compose.run(load_config(ICP_CONFIG_PATH), dry_run=args.dry_run)
+
+        if args.stage == "morning":
+            path = report.build_morning(load_config(ICP_CONFIG_PATH), dry_run=args.dry_run)
+            if path:
+                logger.info("Открыть список: %s", path)
 
         if args.stage in ("collect", "all"):
             config = load_config(args.config)

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import yaml
 
-from src import collect, db, dossier, log, report, targets
+from src import collect, compose, db, dossier, llm, log, report, targets
 from src.providers.checko import CheckoClient, RequestBudget, deep_pick, to_number
 from src.sources import trudvsem as trudvsem_module
 from src.sources.website import _TextExtractor, WebsiteFetcher, normalize_url
@@ -525,6 +525,91 @@ def main() -> int:
     check("реестровые факты попали в запрос", "62.01" in content and "Москва" in content)
     check("численность и выручка попали", "40" in content and "120 млн" in content)
     check("текст сайта попал", "сайты под ключ" in content)
+
+    print("\n[19] Письмо: сборка промпта и досье")
+    icp_full = yaml.safe_load(Path("config/icp.yaml").read_text(encoding="utf-8"))
+
+    for site_type in ("product", "outsourcing", "staffing", "integrator"):
+        prompt = compose.build_system_prompt(site_type)
+        check(f"промпт для «{site_type}» собран",
+              len(prompt) > 1500 and "Про этого адресата" in prompt)
+    check("неизвестный тип падает на запасной угол",
+          "Про этого адресата" in compose.build_system_prompt("нет_такого_типа"))
+    check("общие запреты попали в промпт",
+          "восклицательные знаки" in compose.build_system_prompt("product"))
+    check("продуктовым говорим про их ICP",
+          "ICP острее" in compose.build_system_prompt("product"))
+    check("аутсорсу говорим про предсказуемость потока",
+          "предсказуемость потока" in compose.build_system_prompt("outsourcing"))
+
+    print("\n[20] Сквозной прогон: досье → письмо → утренний список")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        db.DB_PATH = tmp_path / "e2e.db"
+        report.MORNING_DIR = tmp_path / "morning"
+
+        conn = db.connect()
+        conn.execute(
+            "INSERT INTO companies (inn,name,first_seen,last_seen,region,site,"
+            "contact_email,okved,okved_name,staff,revenue,revenue_prev,"
+            "revenue_change_pct,icp_status,checked_at,site_url,site_type,"
+            "site_confidence,site_summary,site_specialization,site_checked_at) "
+            "VALUES ('7701','ООО \"АЛЬТА-СОФТ\"','t','t','Москва','alta.ru',"
+            "'info@alta.ru','62.01','Разработка ПО',88,310e6,243e6,27.5,'passed','t',"
+            "'https://alta.ru','product',0.92,'Софт для таможенного оформления',"
+            "'[\"таможня\", \"ВЭД\"]','t')")
+        conn.commit()
+        row = conn.execute("SELECT * FROM companies").fetchone()
+        dossier_text = compose.build_dossier(row)
+        conn.close()
+
+        check("в досье попало описание с сайта", "таможенного оформления" in dossier_text)
+        check("в досье попала выручка и динамика",
+              "310 млн" in dossier_text and "+28%" in dossier_text, dossier_text)
+        check("в досье попала выручка на сотрудника",
+              "на сотрудника: 3.5" in dossier_text, dossier_text)
+        check("в досье есть запрет на выдумки",
+              "Ничего сверх этого списка" in dossier_text)
+
+        # Подменяем модель: сквозной прогон не должен ходить в сеть.
+        captured: dict = {}
+
+        def fake_classify(system_prompt, user_content, schema, max_tokens=1024):
+            captured["system"] = system_prompt
+            captured["user"] = user_content
+            return {
+                "subject": "Как находить импортёров до тендера",
+                "body": "Вы продаёте софт для таможенного оформления...",
+                "why_line": "продуктовая компания с чётким ICP, выручка растёт",
+                "facts_used": ["софт для таможенного оформления", "88 человек"],
+            }
+
+        original = llm.classify
+        llm.classify = fake_classify
+        try:
+            result = compose.run(icp_full)
+        finally:
+            llm.classify = original
+
+        check("письмо написано", result["written"] == 1, str(result))
+        check("письмо не помечено как шаблонное", result["thin"] == 0, str(result))
+        check("модель получила угол для продуктовой компании",
+              "ICP острее" in captured.get("system", ""))
+        check("модель получила факты из досье",
+              "таможенного оформления" in captured.get("user", ""))
+
+        path = report.build_morning(icp_full)
+        check("утренний список создан", path is not None and path.exists())
+        if path:
+            text = path.read_text(encoding="utf-8")
+            check("в списке есть строка «Почему здесь»", "**Почему здесь:**" in text)
+            check("в списке есть тема письма", "Как находить импортёров" in text)
+            check("в списке есть текст письма", "софт для таможенного оформления" in text)
+            check("в списке указан тип компании", "продуктовая компания" in text)
+            check("напоминание не хранить ФИО на месте",
+                  "система не хранит" in text)
+
+        check("повторный список пуст", report.build_morning(icp_full) is None)
 
     print()
     if FAILURES:

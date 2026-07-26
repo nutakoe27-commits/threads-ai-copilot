@@ -125,6 +125,13 @@ MIGRATIONS = [
     ("companies", "site_specialization", "TEXT"),
     ("companies", "site_checked_at", "TEXT"),
     ("companies", "site_error", "TEXT"),
+    # Этап 3б: сгенерированное письмо. Не отправляется — попадает
+    # в утренний список, где вы его читаете и правите.
+    ("companies", "letter_subject", "TEXT"),
+    ("companies", "letter_body", "TEXT"),
+    ("companies", "letter_why", "TEXT"),
+    ("companies", "letter_facts", "TEXT"),
+    ("companies", "letter_written_at", "TEXT"),
 ]
 
 
