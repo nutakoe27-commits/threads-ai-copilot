@@ -1,0 +1,14 @@
+# Секреты — никогда в репозиторий
+.env
+
+# Рабочие данные
+data/leads.db
+data/leads.db-journal
+logs/
+morning/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
