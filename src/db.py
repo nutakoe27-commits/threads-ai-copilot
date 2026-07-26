@@ -115,6 +115,16 @@ MIGRATIONS = [
     ("companies", "icp_status", "TEXT"),
     ("companies", "icp_reason", "TEXT"),
     ("companies", "checked_at", "TEXT"),
+    # Этап 3: классификация по сайту. Реестр не отличает разработку на заказ
+    # от продуктовой компании, а сайт отличает — см. DECISIONS.md, Р-019.
+    ("companies", "site_url", "TEXT"),
+    # outsourcing | staffing | product | integrator | not_it | unknown
+    ("companies", "site_type", "TEXT"),
+    ("companies", "site_confidence", "REAL"),
+    ("companies", "site_summary", "TEXT"),
+    ("companies", "site_specialization", "TEXT"),
+    ("companies", "site_checked_at", "TEXT"),
+    ("companies", "site_error", "TEXT"),
 ]
 
 

@@ -18,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from src import collect, log, report, targets
+from src import collect, dossier, log, report, targets
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config" / "signals.yaml"
@@ -54,12 +54,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="GTM-система: сбор сигналов и утренний список")
     parser.add_argument(
         "--stage",
-        choices=["targets", "discover", "enrich", "rejudge", "collect", "report", "all"],
+        choices=["targets", "discover", "enrich", "rejudge", "dossier",
+                 "collect", "report", "all"],
         default="all",
         help=(
             "targets — построить целевой список через Checko (discover + enrich); "
             "discover/enrich — половинки этого этапа по отдельности; "
             "rejudge — пересмотреть вердикты по уже скачанным данным, без запросов к API; "
+            "dossier — обойти сайты прошедших ICP и классифицировать их; "
             "collect/report — сбор сигналов и утренний список"
         ),
     )
@@ -90,6 +92,9 @@ def main() -> int:
                     targets.discover(icp_config, dry_run=args.dry_run)
                 if args.stage in ("targets", "enrich"):
                     targets.enrich(icp_config, dry_run=args.dry_run)
+
+        if args.stage == "dossier":
+            dossier.run(load_config(ICP_CONFIG_PATH), dry_run=args.dry_run)
 
         if args.stage in ("collect", "all"):
             config = load_config(args.config)

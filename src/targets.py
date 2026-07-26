@@ -285,7 +285,8 @@ def enrich(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
         conn.close()
         return {"checked": 0, "passed": 0, "rejected": 0}
 
-    logger.info("Проверяю %d компаний (бюджет позволяет ~%d)", len(candidates), budget.left // 2)
+    logger.info("Компаний к проверке: %d (бюджет позволяет ~%d)",
+                len(candidates), budget.left // 2)
 
     counters = {"checked": 0, "passed": 0, "rejected": 0, "saved_requests": 0}
     try:
@@ -415,7 +416,7 @@ def rejudge(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
         conn.commit()
     conn.close()
 
-    logger.info("Пересмотрено %d компаний: прошло %d, отсеяно %d, изменилось решений %d. "
+    logger.info("Пересмотрено записей: %d. Прошло %d, отсеяно %d, изменилось решений %d. "
                 "Запросов к API потрачено: 0",
                 counters["rejudged"], counters["passed"],
                 counters["rejected"], counters["changed"])

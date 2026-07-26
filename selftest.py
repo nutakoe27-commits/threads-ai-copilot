@@ -20,9 +20,10 @@ from pathlib import Path
 
 import yaml
 
-from src import collect, db, log, report, targets
+from src import collect, db, dossier, log, report, targets
 from src.providers.checko import CheckoClient, RequestBudget, deep_pick, to_number
 from src.sources import trudvsem as trudvsem_module
+from src.sources.website import _TextExtractor, normalize_url
 from src.sources.trudvsem import TrudvsemClient, TrudvsemError
 
 FAILURES: list[str] = []
@@ -462,6 +463,57 @@ def main() -> int:
     spent = [budget.try_spend() for _ in range(5)]
     check("тратится ровно лимит", spent == [True, True, True, False, False], str(spent))
     check("остаток не уходит в минус", budget.left == 0)
+
+    print("\n[16] Сайт компании: адрес и извлечение текста")
+    check("голый домен получает https",
+          normalize_url("example.ru") == "https://example.ru")
+    check("лишний путь отбрасывается",
+          normalize_url("https://example.ru/about/?utm=1") == "https://example.ru")
+    check("мусор из ЕГРЮЛ не ломает разбор",
+          normalize_url("не указан") is None, str(normalize_url("не указан")))
+    check("пустое значение даёт None", normalize_url("") is None)
+
+    extractor = _TextExtractor()
+    extractor.feed(
+        "<html><head><title>T</title><style>.a{color:red}</style></head>"
+        "<body><script>var x=1;</script><h1>Разработка на заказ</h1>"
+        "<p>Делаем&nbsp;проекты   под ключ</p></body></html>"
+    )
+    text = extractor.text()
+    check("скрипты и стили выкинуты",
+          "var x" not in text and "color:red" not in text, text)
+    check("видимый текст собран", "Разработка на заказ" in text, text)
+    check("пробелы схлопнуты", "проекты под ключ" in text, text)
+
+    print("\n[17] Классификация: схема и промпт")
+    schema_types = set(dossier.CLASSIFY_SCHEMA["properties"]["type"]["enum"])
+    check("все категории схемы имеют человеческое название",
+          schema_types == set(dossier.TYPE_LABELS), str(schema_types ^ set(dossier.TYPE_LABELS)))
+    check("схема запрещает лишние поля",
+          dossier.CLASSIFY_SCHEMA["additionalProperties"] is False)
+    check("обязательны все четыре поля",
+          set(dossier.CLASSIFY_SCHEMA["required"])
+          == {"type", "confidence", "summary", "specialization"})
+    check("промпт классификации на месте и не пуст",
+          len(dossier.load_prompt("classify.md")) > 500)
+    check("промпт описывает целевые категории",
+          "outsourcing" in dossier.load_prompt("classify.md"))
+
+    print("\n[18] Что видит модель")
+    with tempfile.TemporaryDirectory() as tmp:
+        db.DB_PATH = Path(tmp) / "t.db"
+        conn = db.connect()
+        conn.execute(
+            "INSERT INTO companies (inn,name,first_seen,last_seen,okved,okved_name,"
+            "staff,revenue,region) VALUES ('1','ООО Пример','t','t','62.01',"
+            "'Разработка ПО',40,120e6,'Москва')")
+        conn.commit()
+        row = conn.execute("SELECT * FROM companies WHERE inn='1'").fetchone()
+        content = dossier.build_user_content(row, "Мы делаем сайты под ключ")
+        conn.close()
+    check("реестровые факты попали в запрос", "62.01" in content and "Москва" in content)
+    check("численность и выручка попали", "40" in content and "120 млн" in content)
+    check("текст сайта попал", "сайты под ключ" in content)
 
     print()
     if FAILURES:
