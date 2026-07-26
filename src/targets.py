@@ -1,15 +1,21 @@
 """Этап 2: построение целевого списка компаний по критериям ICP.
 
-Работает в два прохода, оба возобновляемые:
+Два прохода, оба возобновляемые:
 
-  1. discover — поиск кандидатов по ОКВЭД и регионам. Пишет в базу только
-     ИНН и название, без обогащения. Дёшево по запросам.
-  2. enrich   — по каждому неизвестному кандидату запрашивает карточку и
-     выносит вердикт по ICP. Дорого: 1 запрос на компанию.
+  1. discover — поиск кандидатов по ОКВЭД и регионам. Пишет только ИНН и
+     название. Останавливается, как только накоплен буфер работы на
+     несколько дней вперёд, и запоминает, на какой странице остановился.
+  2. enrich   — проверка кандидатов. Двухступенчатая, чтобы экономить запросы:
+       ступень 1 (1 запрос): карточка. ОКВЭД, штат, возраст, активность.
+                             Не прошло — на этом всё, финансы не запрашиваем.
+       ступень 2 (1 запрос): финансы. Только для прошедших ступень 1.
 
-Суточный лимит Checko (100 запросов на бесплатном тарифе) — не помеха:
-упёрлись — остановились, прогресс в базе, завтра продолжаем с того же
-места. Ничего не теряется и не запрашивается повторно.
+ПРО ОБЪЁМ. Кандидатов десятки тысяч: только по ОКВЭД 62.01 в Москве Checko
+показывает около 14 000 компаний. Перебрать всех при 100 запросах в сутки
+невозможно, и не нужно: при потребности в 20 письмах в день достаточно
+проверять ~50 компаний в сутки. Список не обязан быть полным — он обязан
+давать стабильный приток. Поэтому discover набирает буфер и останавливается,
+а enrich каждый день откусывает от него столько, сколько позволяет бюджет.
 """
 
 from __future__ import annotations
@@ -26,82 +32,109 @@ PROVIDER = "checko"
 
 
 def _years_since(date_str: str) -> float | None:
-    """Возраст компании в годах по дате регистрации."""
-    if not date_str:
+    """Возраст компании в годах по дате регистрации (формат ГГГГ-ММ-ДД)."""
+    if not date_str or len(date_str) < 10:
         return None
-    for fmt_len, sep in ((10, "-"), (10, ".")):
-        parts = date_str[:fmt_len].split(sep)
-        if len(parts) == 3:
-            try:
-                # Формат может быть и ГГГГ-ММ-ДД, и ДД.ММ.ГГГГ.
-                if len(parts[0]) == 4:
-                    year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
-                else:
-                    day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
-                delta = date.today() - date(year, month, day)
-                return delta.days / 365.25
-            except ValueError:
-                continue
-    return None
+    try:
+        year, month, day = (int(part) for part in date_str[:10].split("-"))
+        return (date.today() - date(year, month, day)).days / 365.25
+    except ValueError:
+        return None
 
 
-def judge(company: dict[str, Any], criteria: dict[str, Any]) -> tuple[str, str]:
-    """Выносит вердикт по ICP. Возвращает (статус, причина человеческим языком).
+def judge_profile(company: dict[str, Any], criteria: dict[str, Any]) -> tuple[bool, str]:
+    """Ступень 1: всё, что видно из карточки. Финансы здесь не участвуют.
 
-    Причина сохраняется в базу, чтобы потом можно было понять, почему
-    компания не попала в список, и при необходимости смягчить критерий —
-    не перезапрашивая API.
+    Возвращает (проходит ли дальше, причина). Причина сохраняется в базу
+    человеческим языком, чтобы потом можно было понять, не слишком ли жёсткий
+    критерий, не перезапрашивая API.
     """
+    if not company.get("active", True):
+        return False, "компания не действует"
+
     exclude = [str(code) for code in criteria.get("exclude_okved", [])]
     all_okved = [company.get("okved") or ""] + list(company.get("extra_okved") or [])
     for code in all_okved:
         for bad in exclude:
             if code.startswith(bad):
-                return "rejected", f"ОКВЭД {code} в списке исключений (кадровые агентства)"
+                return False, f"ОКВЭД {code} в списке исключений (кадровые агентства)"
 
     staff = company.get("staff")
-    staff_min = criteria.get("staff_min")
-    staff_max = criteria.get("staff_max")
+    staff_min, staff_max = criteria.get("staff_min"), criteria.get("staff_max")
     if staff is None:
-        return "rejected", "нет данных о численности персонала"
+        return False, "нет данных о численности персонала"
     if staff_min is not None and staff < staff_min:
-        return "rejected", f"штат {staff:.0f} меньше порога {staff_min}"
+        return False, f"штат {staff:.0f} меньше порога {staff_min}"
     if staff_max is not None and staff > staff_max:
-        return "rejected", f"штат {staff:.0f} больше порога {staff_max}"
-
-    revenue = company.get("revenue")
-    revenue_min = criteria.get("revenue_min")
-    revenue_max = criteria.get("revenue_max")
-    if revenue is None:
-        return "rejected", "нет данных о выручке"
-    if revenue_min is not None and revenue < revenue_min:
-        return "rejected", f"выручка {revenue / 1e6:.1f} млн меньше порога"
-    if revenue_max is not None and revenue > revenue_max:
-        return "rejected", f"выручка {revenue / 1e6:.1f} млн больше порога"
+        return False, f"штат {staff:.0f} больше порога {staff_max}"
 
     age = _years_since(company.get("registration_date") or "")
     min_age = criteria.get("min_age_years")
     if min_age is not None and age is not None and age < min_age:
-        return "rejected", f"возраст {age:.1f} года меньше порога {min_age}"
+        return False, f"возраст {age:.1f} года меньше порога {min_age}"
 
-    return "passed", (
-        f"ОКВЭД {company.get('okved')}, штат {staff:.0f}, "
-        f"выручка {revenue / 1e6:.1f} млн"
-    )
+    return True, f"профиль подходит: ОКВЭД {company.get('okved')}, штат {staff:.0f}"
+
+
+def judge_finances(finances: dict[str, Any], criteria: dict[str, Any]) -> tuple[bool, str]:
+    """Ступень 2: выручка. Запрашивается только для прошедших ступень 1."""
+    revenue = finances.get("revenue")
+    revenue_min, revenue_max = criteria.get("revenue_min"), criteria.get("revenue_max")
+
+    if revenue is None:
+        return False, "нет данных о выручке"
+    if revenue_min is not None and revenue < revenue_min:
+        return False, f"выручка {revenue / 1e6:.1f} млн меньше порога"
+    if revenue_max is not None and revenue > revenue_max:
+        return False, f"выручка {revenue / 1e6:.1f} млн больше порога"
+
+    change = finances.get("revenue_change_pct")
+    if change is None:
+        return True, f"выручка {revenue / 1e6:.1f} млн, динамика неизвестна"
+    return True, f"выручка {revenue / 1e6:.1f} млн, динамика {change:+.1f}%"
+
+
+def describe_signal(change_pct: float | None, scoring: dict[str, Any]) -> tuple[str, str]:
+    """Превращает динамику выручки в силу сигнала и строку «почему она здесь».
+
+    Пока событийный источник не найден, приоритет в утреннем списке задаётся
+    именно этим — см. DECISIONS.md, Р-017.
+    """
+    if change_pct is None:
+        return "normal", "динамика выручки неизвестна"
+
+    strong_decline = float(scoring.get("strong_decline_pct", -10.0))
+    flat_from = float(scoring.get("flat_from_pct", -10.0))
+    flat_to = float(scoring.get("flat_to_pct", 5.0))
+
+    if change_pct <= strong_decline:
+        return "strong", f"выручка упала на {abs(change_pct):.0f}% год к году"
+    if flat_from < change_pct <= flat_to:
+        return "strong", f"выручка стоит на месте ({change_pct:+.0f}% год к году)"
+    return "normal", f"выручка выросла на {change_pct:.0f}% год к году"
 
 
 def discover(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
-    """Проход 1: поиск кандидатов по ОКВЭД и регионам."""
+    """Проход 1: набрать буфер кандидатов, запомнив, где остановились."""
     provider_cfg = config.get("provider", {})
     target_cfg = config.get("target_list", {})
+    buffer_target = int(provider_cfg.get("candidate_buffer", 500))
+    max_search_requests = int(provider_cfg.get("discover_per_run", 10))
 
     conn = db.connect()
     spent_today = db.requests_spent_today(conn, PROVIDER)
     budget = RequestBudget(int(provider_cfg.get("daily_request_budget", 100)), spent_today)
-    logger.info("Бюджет запросов Checko на сегодня: осталось %d из %d",
-                budget.left, budget.limit)
 
-    counters = {"found": 0, "new": 0}
+    buffered = db.count_unchecked(conn)
+    logger.info("Непроверенных кандидатов в буфере: %d (цель %d). "
+                "Бюджет запросов сегодня: осталось %d", buffered, buffer_target, budget.left)
+
+    counters = {"found": 0, "new": 0, "requests": 0}
+    if buffered >= buffer_target:
+        logger.info("Буфер полон, поиск не нужен — сразу к проверке")
+        conn.close()
+        return counters
+
     try:
         client = CheckoClient(provider_cfg, budget)
     except CheckoError as exc:
@@ -112,21 +145,43 @@ def discover(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
     try:
         for okved in target_cfg.get("okved", []):
             for region in target_cfg.get("regions", []):
-                try:
-                    for record in client.iter_candidates(
-                        okved, region["code"], region["name"],
-                        target_cfg.get("opf"), bool(target_cfg.get("only_active", True)),
-                    ):
-                        counters["found"] += 1
-                        if dry_run:
-                            continue
-                        if db.add_candidate(conn, record["inn"], record["name"], region["name"]):
-                            counters["new"] += 1
-                except CheckoError as exc:
-                    # Один неудачный срез не должен ронять весь проход.
-                    logger.error("ОКВЭД %s / %s пропущен: %s", okved, region["name"], exc)
+                if buffered >= buffer_target or counters["requests"] >= max_search_requests:
+                    break
+
+                cursor = db.get_cursor(conn, okved, region["code"])
+                if cursor and cursor["exhausted"]:
                     continue
+                page = int(cursor["next_page"]) if cursor else 1
+
+                try:
+                    payload = client.search_by_okved(
+                        okved, region["code"], target_cfg.get("opf"),
+                        bool(target_cfg.get("only_active", True)), page,
+                    )
+                except CheckoError as exc:
+                    logger.error("ОКВЭД %s / %s стр. %d пропущена: %s",
+                                 okved, region["name"], page, exc)
+                    continue
+
+                counters["requests"] += 1
+                data = payload.get("data") or {}
+                total_pages = int(data.get("СтрВсего") or 0) or None
+                records = CheckoClient.parse_search_results(payload)
+
+                logger.info("ОКВЭД %s / %s: страница %d из %s — %d компаний",
+                            okved, region["name"], page, total_pages or "?", len(records))
+
+                for record in records:
+                    counters["found"] += 1
+                    if dry_run:
+                        continue
+                    if db.add_candidate(conn, record["inn"], record["name"], region["name"]):
+                        counters["new"] += 1
+                        buffered += 1
+
+                exhausted = not records or (total_pages is not None and page >= total_pages)
                 if not dry_run:
+                    db.save_cursor(conn, okved, region["code"], page + 1, total_pages, exhausted)
                     conn.commit()
     except BudgetExhausted as exc:
         logger.warning("%s", exc)
@@ -136,36 +191,38 @@ def discover(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
         conn.commit()
     conn.close()
 
-    logger.info("Поиск кандидатов: найдено %d, новых %d, запросов потрачено %d",
-                counters["found"], counters["new"], budget.spent - spent_today)
+    logger.info("Поиск: страниц запрошено %d, найдено %d, новых кандидатов %d",
+                counters["requests"], counters["found"], counters["new"])
     return counters
 
 
 def enrich(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
-    """Проход 2: карточка по каждому кандидату и вердикт по ICP."""
+    """Проход 2: двухступенчатая проверка кандидатов."""
     provider_cfg = config.get("provider", {})
     criteria = config.get("criteria", {})
+    scoring = config.get("signal_scoring", {})
 
     conn = db.connect()
     spent_today = db.requests_spent_today(conn, PROVIDER)
     budget = RequestBudget(int(provider_cfg.get("daily_request_budget", 100)), spent_today)
 
-    per_run = int(provider_cfg.get("enrich_per_run", 80))
-    limit = min(per_run, budget.left)
+    # Каждая компания стоит 1–2 запроса, поэтому берём с запасом по бюджету.
+    limit = min(int(provider_cfg.get("enrich_per_run", 40)), max(0, budget.left // 2))
     if limit <= 0:
-        logger.warning("Бюджет запросов Checko на сегодня исчерпан. Продолжим завтра")
+        logger.warning("Бюджета на проверку не осталось (%d запросов). Продолжим завтра",
+                       budget.left)
         conn.close()
         return {"checked": 0, "passed": 0, "rejected": 0}
 
     candidates = db.unchecked_candidates(conn, limit)
     if not candidates:
-        logger.info("Все известные кандидаты уже проверены")
+        logger.info("Все известные кандидаты проверены. Запустите discover за новыми")
         conn.close()
         return {"checked": 0, "passed": 0, "rejected": 0}
 
-    logger.info("Проверяю %d компаний (бюджет позволяет %d)", len(candidates), budget.left)
+    logger.info("Проверяю %d компаний (бюджет позволяет ~%d)", len(candidates), budget.left // 2)
 
-    counters = {"checked": 0, "passed": 0, "rejected": 0}
+    counters = {"checked": 0, "passed": 0, "rejected": 0, "saved_requests": 0}
     try:
         client = CheckoClient(provider_cfg, budget)
     except CheckoError as exc:
@@ -177,24 +234,49 @@ def enrich(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
         for row in candidates:
             inn = row["inn"]
             try:
-                payload = client.company(inn)
+                company = CheckoClient.parse_company(client.company(inn))
             except BudgetExhausted:
                 raise
             except CheckoError as exc:
                 logger.error("ИНН %s пропущен: %s", inn, exc)
                 continue
 
-            company = CheckoClient.parse_company(payload)
-            status, reason = judge(company, criteria)
             counters["checked"] += 1
+            fields: dict[str, Any] = dict(company)
+
+            ok, reason = judge_profile(company, criteria)
+            if not ok:
+                # Финансы не запрашиваем — экономим запрос.
+                counters["rejected"] += 1
+                counters["saved_requests"] += 1
+                logger.debug("✗ %s — %s", company.get("name") or row["name"], reason)
+                if not dry_run:
+                    db.save_icp_verdict(conn, inn, fields, "rejected", reason)
+                continue
+
+            try:
+                finances = CheckoClient.parse_finances(client.finances(inn))
+            except BudgetExhausted:
+                raise
+            except CheckoError as exc:
+                logger.warning("ИНН %s: финансы не получены (%s), решаем без них", inn, exc)
+                finances = {}
+
+            fields.update(finances)
+            ok, fin_reason = judge_finances(finances, criteria)
+            status = "passed" if ok else "rejected"
             counters[status] += 1
 
-            level = logger.info if status == "passed" else logger.debug
-            level("%s %s — %s (%s)", "✓" if status == "passed" else "✗",
-                  company.get("name") or row["name"], reason, inn)
+            if ok:
+                strength, why = describe_signal(finances.get("revenue_change_pct"), scoring)
+                reason = f"{fin_reason}. {why}"
+                logger.info("✓ %s — %s [%s]", company.get("name") or row["name"], reason, strength)
+            else:
+                reason = fin_reason
+                logger.debug("✗ %s — %s", company.get("name") or row["name"], reason)
 
             if not dry_run:
-                db.save_icp_verdict(conn, inn, company, status, reason)
+                db.save_icp_verdict(conn, inn, fields, status, reason)
     except BudgetExhausted as exc:
         logger.warning("%s", exc)
 
@@ -203,16 +285,18 @@ def enrich(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
         conn.commit()
 
     summary = db.icp_summary(conn)
+    remaining = db.count_unchecked(conn)
     conn.close()
 
-    logger.info("Проверено %d: прошло ICP %d, отсеяно %d",
-                counters["checked"], counters["passed"], counters["rejected"])
-    logger.info("Целевой список сейчас: %s",
-                ", ".join(f"{k}: {v}" for k, v in sorted(summary.items())))
+    logger.info("Проверено %d: прошло ICP %d, отсеяно %d (сэкономлено запросов на финансы: %d)",
+                counters["checked"], counters["passed"], counters["rejected"],
+                counters["saved_requests"])
+    logger.info("Целевой список: %s. Ждут проверки: %d",
+                ", ".join(f"{k}: {v}" for k, v in sorted(summary.items())), remaining)
     return counters
 
 
 def run(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
-    """Полный проход этапа: сначала поиск, потом обогащение."""
+    """Полный проход этапа: сначала добрать кандидатов, потом проверить."""
     discover(config, dry_run=dry_run)
     return enrich(config, dry_run=dry_run)

@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -307,51 +308,133 @@ def main() -> int:
               collect.match_keywords(job, "активные продажи, формирование базы", keywords) is None,
               f"«{job}» всё ещё проходит")
 
-    print("\n[10] Checko: рекурсивный поиск полей в ответе")
-    # Ответ приходит на русских ключах и с неизвестной вложенностью,
-    # поэтому разбор должен находить поле на любой глубине.
-    nested = {"data": {"Реквизиты": {"ИНН": "7736207543"},
-                       "ОКВЭД": {"Код": "62.01", "Наим": "Разработка ПО"},
-                       "Показатели": {"СЧР": 45, "Выручка": "120 000 000,50"}}}
-    check("ИНН найден во вложенном словаре", deep_pick(nested, "ИНН", "inn") == "7736207543")
-    check("приоритет у первого имени из списка",
-          deep_pick({"a": {"inn": "2"}, "ИНН": "1"}, "ИНН", "inn") == "1")
-    check("число с пробелами и запятой разобрано",
-          to_number("120 000 000,50") == 120000000.5)
-    check("пустая строка не считается значением",
-          deep_pick({"ИНН": "", "x": {"ИНН": "77"}}, "ИНН") == "77")
+    print("\n[10] Checko: разбор настоящего ответа (снят зондом 2026-07-26)")
+    # Это НЕ выдуманные данные: фрагменты реального ответа Checko,
+    # включая блоки с персональными данными, которые мы обязаны игнорировать.
+    real_search = {"data": {
+        "ЗапВсего": 13955, "СтрВсего": 140, "СтрТекущ": 1,
+        "Записи": [
+            {"ОГРН": "1023201336344", "ИНН": "3203006518",
+             "НаимСокр": 'ООО "АНАНТА"', "ДатаРег": "1999-07-30",
+             "Статус": "Действует", "РегионКод": "77",
+             "ОКВЭД": "Разработка компьютерного программного обеспечения",
+             "Руковод": [{"ФИО": "Шульгин Игорь Сергеевич", "ИНН": "461703208229"}],
+             "Учред": {"ФЛ": [{"ФИО": "Шульгин Игорь Сергеевич",
+                               "ИНН": "461703208229"}]}},
+            {"ОГРН": "1024000950368", "ИНН": "4025070110",
+             "НаимСокр": 'ООО "ИНТЕГРАЛ КТ"', "Статус": "Действует"},
+        ],
+    }}
+    records = CheckoClient.parse_search_results(real_search)
+    check("из поиска извлечены обе компании", len(records) == 2, str(len(records)))
+    check("взят ИНН юрлица, а не руководителя",
+          records[0]["inn"] == "3203006518", records[0]["inn"])
+    check("название компании извлечено", records[0]["name"] == 'ООО "АНАНТА"')
 
-    parsed_company = CheckoClient.parse_company(nested)
-    check("из карточки извлечён ОКВЭД", parsed_company["okved"] == "62.01")
-    check("из карточки извлечена численность", parsed_company["staff"] == 45.0)
-    check("из карточки извлечена выручка", parsed_company["revenue"] == 120000000.5)
+    # Требование Р-000: персональные данные в систему не попадают.
+    leaked = [key for record in records for key in record
+              if key not in ("inn", "name")]
+    check("из поиска не утекли ФИО и прочие поля", not leaked, str(leaked))
+    check("ФИО отсутствуют в результате целиком",
+          "Шульгин" not in json.dumps(records, ensure_ascii=False))
 
-    print("\n[11] Вердикт по ICP")
-    criteria = yaml.safe_load(Path("config/icp.yaml").read_text(encoding="utf-8"))["criteria"]
+    real_company = {"data": {
+        "ОГРН": "1023201336344", "ИНН": "3203006518", "ДатаРег": "1999-07-30",
+        "НаимСокр": 'ООО "АНАНТА"',
+        "Статус": {"Код": "001", "Наим": "Действует"},
+        "Регион": {"Код": "77", "Наим": "Москва"},
+        "ОКВЭД": {"Код": "62.01", "Наим": "Разработка компьютерного ПО", "Версия": "2014"},
+        "ОКВЭДДоп": [{"Код": "46.52", "Наим": "Торговля оптовая"},
+                     {"Код": "62.02", "Наим": "Консультативная деятельность"}],
+        "Контакты": {"Тел": ["+7 495 000-00-00"],
+                     "Емэйл": ["info@example.ru", "sales@example.ru"],
+                     "ВебСайт": "https://example.ru"},
+        "Налоги": {"СумУпл": 1234567.0, "СведУплГод": "2024"},
+        "РМСП": {"Кат": "МАЛОЕ ПРЕДПРИЯТИЕ"},
+        "СЧР": 45,
+        "Руковод": [{"ФИО": "Шульгин Игорь Сергеевич", "ИНН": "461703208229"}],
+    }}
+    parsed_company = CheckoClient.parse_company(real_company)
+    check("ОКВЭД извлечён кодом", parsed_company["okved"] == "62.01")
+    check("дополнительные ОКВЭД извлечены", parsed_company["extra_okved"] == ["46.52", "62.02"])
+    check("регион — название, а не словарь", parsed_company["region"] == "Москва")
+    check("сайт из Контакты.ВебСайт", parsed_company["site"] == "https://example.ru")
+    check("почта — первая из списка", parsed_company["email"] == "info@example.ru")
+    check("телефон — первый из списка", parsed_company["phone"] == "+7 495 000-00-00")
+    check("численность из СЧР", parsed_company["staff"] == 45.0)
+    check("статус «Действует» распознан", parsed_company["active"] is True)
+    check("категория МСП извлечена", parsed_company["msp_category"] == "МАЛОЕ ПРЕДПРИЯТИЕ")
+    check("ФИО руководителя не попали в разбор",
+          "Шульгин" not in json.dumps(parsed_company, ensure_ascii=False))
+
+    check("ликвидированная компания распознана",
+          CheckoClient.parse_company(
+              {"data": {"Статус": {"Наим": "Ликвидировано"}}})["active"] is False)
+
+    print("\n[11] Разбор финансов и динамика выручки")
+    finances = CheckoClient.parse_finances(
+        {"data": {"2024": {"2110": 120_000_000}, "2023": {"2110": 150_000_000}}})
+    check("выручка за последний год", finances["revenue"] == 120_000_000)
+    check("выручка за предыдущий год", finances["revenue_prev"] == 150_000_000)
+    check("падение посчитано верно",
+          abs(finances["revenue_change_pct"] - (-20.0)) < 0.01,
+          str(finances["revenue_change_pct"]))
+    check("год выручки определён", finances["revenue_year"] == "2024")
+
+    single_year = CheckoClient.parse_finances({"data": {"2024": {"2110": 50_000_000}}})
+    check("один год — динамика None, а не ноль", single_year["revenue_change_pct"] is None)
+    check("отсутствие финансов не роняет разбор",
+          CheckoClient.parse_finances({})["revenue"] is None)
+
+    print("\n[12] Сила сигнала по динамике выручки")
+    scoring = yaml.safe_load(
+        Path("config/icp.yaml").read_text(encoding="utf-8"))["signal_scoring"]
+    check("падение на 20% → сильный сигнал",
+          targets.describe_signal(-20.0, scoring)[0] == "strong")
+    check("стагнация 1% → сильный сигнал",
+          targets.describe_signal(1.0, scoring)[0] == "strong")
+    check("рост 40% → обычный сигнал",
+          targets.describe_signal(40.0, scoring)[0] == "normal")
+    check("формулировка про падение понятна",
+          "упала" in targets.describe_signal(-20.0, scoring)[1])
+
+    print("\n[13] Вердикт по ICP: ступень 1 (профиль)")
+    icp = yaml.safe_load(Path("config/icp.yaml").read_text(encoding="utf-8"))
+    criteria = icp["criteria"]
     fits = {"okved": "62.01", "extra_okved": [], "staff": 40.0,
-            "revenue": 120_000_000.0, "registration_date": "2015-03-10"}
+            "registration_date": "2015-03-10", "active": True}
 
-    status, _ = targets.judge(fits, criteria)
-    check("подходящая компания проходит", status == "passed", status)
+    ok, _ = targets.judge_profile(fits, criteria)
+    check("подходящий профиль проходит", ok is True)
 
-    status, reason = targets.judge({**fits, "staff": 5.0}, criteria)
-    check("мелкая компания отсеивается по штату", status == "rejected")
+    ok, reason = targets.judge_profile({**fits, "staff": 5.0}, criteria)
+    check("мелкая компания отсеивается", ok is False)
     check("причина отказа человекочитаема", "штат" in reason, reason)
 
-    status, _ = targets.judge({**fits, "staff": 500.0}, criteria)
-    check("крупная компания отсеивается по штату", status == "rejected")
+    ok, _ = targets.judge_profile({**fits, "staff": 500.0}, criteria)
+    check("крупная компания отсеивается", ok is False)
 
-    status, _ = targets.judge({**fits, "revenue": 1_000_000.0}, criteria)
-    check("компания без выручки отсеивается", status == "rejected")
-
-    status, reason = targets.judge({**fits, "extra_okved": ["78.10"]}, criteria)
-    check("кадровое агентство отсеивается по доп. ОКВЭД", status == "rejected")
+    ok, reason = targets.judge_profile({**fits, "extra_okved": ["78.10"]}, criteria)
+    check("кадровое агентство отсеивается по доп. ОКВЭД", ok is False)
     check("причина называет ОКВЭД", "78.10" in reason, reason)
 
-    status, _ = targets.judge({**fits, "staff": None}, criteria)
-    check("нет данных о штате → отказ, а не пропуск", status == "rejected")
+    ok, _ = targets.judge_profile({**fits, "staff": None}, criteria)
+    check("нет данных о штате → отказ, а не пропуск", ok is False)
 
-    print("\n[12] Бюджет запросов")
+    ok, reason = targets.judge_profile({**fits, "active": False}, criteria)
+    check("недействующая компания отсеивается", ok is False)
+
+    print("\n[14] Вердикт по ICP: ступень 2 (финансы)")
+    ok, _ = targets.judge_finances({"revenue": 120_000_000.0,
+                                    "revenue_change_pct": -15.0}, criteria)
+    check("подходящая выручка проходит", ok is True)
+    ok, _ = targets.judge_finances({"revenue": 1_000_000.0}, criteria)
+    check("слишком малая выручка отсеивается", ok is False)
+    ok, reason = targets.judge_finances({}, criteria)
+    check("нет данных о выручке → отказ", ok is False)
+    check("причина названа", "выручк" in reason, reason)
+
+    print("\n[15] Бюджет запросов")
     budget = RequestBudget(limit=3)
     spent = [budget.try_spend() for _ in range(5)]
     check("тратится ровно лимит", spent == [True, True, True, False, False], str(spent))

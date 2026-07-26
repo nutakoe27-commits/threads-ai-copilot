@@ -69,6 +69,19 @@ CREATE TABLE IF NOT EXISTS api_usage (
     PRIMARY KEY (day, provider)
 );
 
+-- Курсор поиска: докуда дошли по каждой паре ОКВЭД+регион.
+-- Кандидатов десятки тысяч, за раз их не перебрать, поэтому поиск
+-- продолжается с того места, где остановился вчера.
+CREATE TABLE IF NOT EXISTS search_cursor (
+    okved           TEXT NOT NULL,
+    region          TEXT NOT NULL,
+    next_page       INTEGER NOT NULL DEFAULT 1,
+    total_pages     INTEGER,
+    exhausted       INTEGER NOT NULL DEFAULT 0,
+    updated_at      TEXT,
+    PRIMARY KEY (okved, region)
+);
+
 CREATE TABLE IF NOT EXISTS runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     stage           TEXT NOT NULL,
@@ -257,6 +270,35 @@ def add_candidate(conn: sqlite3.Connection, inn: str, name: str, region: str) ->
         (inn, name, region, ts, ts),
     )
     return cur.rowcount > 0
+
+
+def get_cursor(conn: sqlite3.Connection, okved: str, region: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM search_cursor WHERE okved = ? AND region = ?", (okved, region)
+    ).fetchone()
+
+
+def save_cursor(conn: sqlite3.Connection, okved: str, region: str,
+                next_page: int, total_pages: int | None, exhausted: bool) -> None:
+    conn.execute(
+        """
+        INSERT INTO search_cursor (okved, region, next_page, total_pages, exhausted, updated_at)
+        VALUES (:okved, :region, :next_page, :total_pages, :exhausted, :ts)
+        ON CONFLICT(okved, region) DO UPDATE SET
+            next_page = :next_page, total_pages = :total_pages,
+            exhausted = :exhausted, updated_at = :ts
+        """,
+        {"okved": okved, "region": region, "next_page": next_page,
+         "total_pages": total_pages, "exhausted": 1 if exhausted else 0, "ts": now()},
+    )
+
+
+def count_unchecked(conn: sqlite3.Connection) -> int:
+    """Сколько кандидатов ждут проверки. Это буфер работы на будущие дни."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS count FROM companies WHERE checked_at IS NULL"
+    ).fetchone()
+    return int(row["count"])
 
 
 def unchecked_candidates(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:

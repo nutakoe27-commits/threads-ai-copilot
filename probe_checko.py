@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Зонд Checko: тратит 2 запроса и показывает реальную структуру ответа.
+"""Зонд Checko: тратит 3 запроса и показывает реальную структуру ответа.
 
 Зачем отдельный скрипт. Имена полей в ответе Checko я не проверял — доступа
 к API из среды разработки не было. Разбор в src/providers/checko.py написан
@@ -8,7 +8,7 @@
 где номер страницы приняли за смещение, стоила нам целого прогона.
 
 Запуск:
-    python probe_checko.py            # поиск + карточка (2 запроса)
+    python probe_checko.py            # поиск + карточка + финансы (3 запроса)
     python probe_checko.py 7736207543 # карточка конкретного ИНН
 
 После запуска сверьте вывод с тем, что ищет `parse_company` —
@@ -128,15 +128,41 @@ def main() -> int:
         show("ЧТО ИЗ ЭТОГО ИЗВЛЁК НАШ РАЗБОР", parsed)
 
         missing = [name for name, value in parsed.items()
-                   if value in (None, "", []) and name != "extra_okved"]
+                   if value in (None, "", []) and name not in ("extra_okved", "msp_category")]
         if missing:
             print(f"\n⚠️  Не заполнены поля: {', '.join(missing)}")
             print("   Найдите их реальные имена в ответе выше и допишите в")
             print("   src/providers/checko.py → parse_company()")
         else:
-            print("\n✓ Все нужные поля извлечены, правок не требуется")
+            print("\n✓ Все поля карточки извлечены")
     except Exception as exc:  # noqa: BLE001
         print(f"Карточка не получена: {exc}", file=sys.stderr)
+
+    # --- Запрос 3: финансы ---------------------------------------------------
+    # Выручки в карточке нет — она в отдельном эндпоинте. Его структуру
+    # в присланной документации не описали, поэтому смотрим вживую.
+    print(f"\nЗапрос 3/3: финансовая отчётность по ИНН {inn}")
+    try:
+        response = session.get(
+            f"{BASE_URL}/finances", params={"key": key, "inn": inn}, timeout=30
+        )
+        print(f"HTTP {response.status_code}")
+        payload = response.json()
+        show("ОТВЕТ ФИНАНСОВ", payload)
+
+        from src.providers.checko import CheckoClient as _Client
+
+        parsed_fin = _Client.parse_finances(payload)
+        show("ЧТО ИЗ ЭТОГО ИЗВЛЁК НАШ РАЗБОР", parsed_fin)
+
+        if parsed_fin.get("revenue") is None:
+            print("\n⚠️  Выручка не извлечена. Пришлите вывод выше — поправлю разбор")
+            print("   (ищем код строки 2110 «Выручка» в отчётности по годам)")
+        else:
+            print("\n✓ Выручка извлечена, динамика посчитана")
+    except Exception as exc:  # noqa: BLE001
+        print(f"Финансы не получены: {exc}", file=sys.stderr)
+        print("Возможно, метод называется иначе или не входит в ваш тариф.")
 
     return 0
 

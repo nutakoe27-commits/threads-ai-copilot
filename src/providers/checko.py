@@ -217,43 +217,131 @@ class CheckoClient:
         return self._request("company", {"inn": inn})
 
     @staticmethod
+    def _first(value: Any) -> str:
+        """Контакты приходят списками — берём первый непустой элемент."""
+        if isinstance(value, list):
+            for item in value:
+                if item:
+                    return str(item).strip()
+            return ""
+        return str(value or "").strip()
+
+    @staticmethod
     def parse_company(payload: dict[str, Any]) -> dict[str, Any]:
-        """Достаёт из карточки поля, нужные для проверки ICP."""
+        """Достаёт из карточки поля, нужные для проверки ICP.
+
+        Имена полей сверены с документацией Checko и боевым ответом
+        (зонд от 2026-07-26), поэтому здесь уже адресное обращение, а не
+        рекурсивный поиск наугад.
+
+        ВАЖНО: блоки «Руковод» и «Учред» содержат ФИО и ИНН физлиц. Мы их
+        сознательно не читаем и не храним — см. DECISIONS.md, Р-000.
+        Выручки в этом ответе нет, она в отдельном методе finances().
+        """
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
 
-        okved_node = deep_pick(data, "ОКВЭД", "ОсновнойВидДеятельности", "okved")
+        okved_node = data.get("ОКВЭД") or {}
         if isinstance(okved_node, dict):
-            okved_code = str(deep_pick(okved_node, "Код", "code") or "")
-            okved_name = str(deep_pick(okved_node, "Наим", "Название", "name") or "")
+            okved_code = str(okved_node.get("Код") or "")
+            okved_name = str(okved_node.get("Наим") or "")
         else:
-            okved_code = str(okved_node or "")
-            okved_name = ""
+            okved_code, okved_name = str(okved_node or ""), ""
 
         # Дополнительные ОКВЭД — нужны, чтобы отсечь кадровые агентства,
         # у которых подбор персонала записан вторым видом деятельности.
-        extra_node = deep_pick(data, "ОКВЭДДоп", "ДопВидДеятельности", "okved_extra", default=[])
-        extra_okved: list[str] = []
-        if isinstance(extra_node, list):
-            for item in extra_node:
-                code = deep_pick(item, "Код", "code") if isinstance(item, dict) else item
-                if code:
-                    extra_okved.append(str(code))
+        extra_okved = [
+            str(item.get("Код"))
+            for item in (data.get("ОКВЭДДоп") or [])
+            if isinstance(item, dict) and item.get("Код")
+        ]
+
+        contacts = data.get("Контакты") or {}
+        region_node = data.get("Регион") or {}
+        status_node = data.get("Статус") or {}
+        msp_node = data.get("РМСП") or {}
+        taxes = data.get("Налоги") or {}
+
+        status_name = (
+            status_node.get("Наим") if isinstance(status_node, dict) else status_node
+        )
 
         return {
-            "inn": str(deep_pick(data, "ИНН", "inn") or ""),
-            "name": str(deep_pick(data, "НаимСокрЮЛ", "НаимСокр", "НаимПолн", "Наим") or ""),
+            "inn": str(data.get("ИНН") or ""),
+            "name": str(data.get("НаимСокр") or data.get("НаимПолн") or ""),
             "okved": okved_code,
             "okved_name": okved_name,
             "extra_okved": extra_okved,
-            "region": str(deep_pick(data, "Регион", "region") or ""),
-            "site": str(deep_pick(data, "Сайт", "ВебСайт", "site") or ""),
-            "email": str(deep_pick(data, "Емэйл", "Email", "email") or ""),
-            "phone": str(deep_pick(data, "Телефон", "phone") or ""),
-            "staff": to_number(deep_pick(data, "СЧР", "СреднесписочнаяЧисленность",
-                                         "Численность", "staff")),
-            "revenue": to_number(deep_pick(data, "Выручка", "revenue")),
-            "registration_date": str(deep_pick(data, "ДатаРег", "ДатаРегистрации") or ""),
-            "active": deep_pick(data, "Активность", "Статус", "active"),
+            "region": str(region_node.get("Наим") if isinstance(region_node, dict)
+                          else region_node or ""),
+            "site": CheckoClient._first(contacts.get("ВебСайт")),
+            "email": CheckoClient._first(contacts.get("Емэйл")),
+            "phone": CheckoClient._first(contacts.get("Тел")),
+            "staff": to_number(data.get("СЧР")),
+            "registration_date": str(data.get("ДатаРег") or ""),
+            "active": str(status_name or "").strip().lower().startswith("действ"),
+            # Категория реестра МСП: микро / малое / среднее предприятие.
+            # Бесплатный ориентир по размеру ещё до запроса финансов.
+            "msp_category": str(msp_node.get("Кат") or "") if isinstance(msp_node, dict) else "",
+            # Сумма уплаченных налогов — грубый, но дешёвый признак живости
+            # компании: нулевые налоги при заявленном штате выглядят странно.
+            "taxes_paid": to_number(taxes.get("СумУпл")) if isinstance(taxes, dict) else None,
+        }
+
+    # --------------------------------------------------------------- финансы
+
+    def finances(self, inn: str) -> dict[str, Any]:
+        """Финансовая отчётность. Отдельный эндпоинт, отдельный запрос."""
+        return self._request("finances", {"inn": inn})
+
+    @staticmethod
+    def parse_finances(payload: dict[str, Any]) -> dict[str, Any]:
+        """Достаёт выручку за два последних года и считает динамику.
+
+        Структура ответа finances не сверялась с документацией (в присланной
+        PDF её нет), поэтому здесь разбор остаётся рекурсивным и терпимым
+        к разной вложенности: ищем словарь, где ключи — годы.
+        """
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+
+        # Ищем узел вида {"2024": {...}, "2023": {...}} на любой глубине.
+        def find_years(node: Any) -> dict[str, Any] | None:
+            if isinstance(node, dict):
+                years = [k for k in node if isinstance(k, str) and k.isdigit() and len(k) == 4]
+                if len(years) >= 1:
+                    return node
+                for value in node.values():
+                    found = find_years(value)
+                    if found:
+                        return found
+            return None
+
+        by_year = find_years(data) or {}
+        years = sorted(
+            (y for y in by_year if isinstance(y, str) and y.isdigit() and len(y) == 4),
+            reverse=True,
+        )
+
+        def revenue_of(year: str) -> float | None:
+            node = by_year.get(year)
+            if node is None:
+                return None
+            if isinstance(node, (int, float, str)):
+                return to_number(node)
+            # Код 2110 — «Выручка» в форме бухгалтерской отчётности.
+            return to_number(deep_pick(node, "2110", "Выручка", "revenue"))
+
+        current = revenue_of(years[0]) if years else None
+        previous = revenue_of(years[1]) if len(years) > 1 else None
+
+        change_pct: float | None = None
+        if current is not None and previous:
+            change_pct = (current - previous) / abs(previous) * 100
+
+        return {
+            "revenue": current,
+            "revenue_prev": previous,
+            "revenue_change_pct": change_pct,
+            "revenue_year": years[0] if years else "",
         }
 
 
