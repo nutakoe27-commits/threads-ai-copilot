@@ -67,7 +67,7 @@ def main() -> int:
     inn_from_search: str | None = None
 
     # --- Запрос 1: поиск -----------------------------------------------------
-    print(f"Запрос 1/2: поиск компаний. ОКВЭД {okved}, регион "
+    print(f"Запрос 1/3: поиск компаний. ОКВЭД {okved}, регион "
           f"{region['name']} (код {region['code']}), ОПФ {target.get('opf')}")
     try:
         response = session.get(
@@ -108,10 +108,10 @@ def main() -> int:
     # --- Запрос 2: карточка --------------------------------------------------
     inn = sys.argv[1] if len(sys.argv) > 1 else inn_from_search
     if not inn:
-        print("\nИНН для карточки не определён — второй запрос пропущен")
+        print("\nИНН для карточки не определён — остальные запросы пропущены")
         return 0
 
-    print(f"\nЗапрос 2/2: карточка компании по ИНН {inn}")
+    print(f"\nЗапрос 2/3: карточка компании по ИНН {inn}")
     try:
         response = session.get(
             f"{BASE_URL}/company", params={"key": key, "inn": inn}, timeout=30
