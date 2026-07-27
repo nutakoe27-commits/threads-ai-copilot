@@ -17,7 +17,7 @@ from typing import Any
 
 import yaml
 
-from . import db, facts as factlib, hiring, llm, log
+from . import db, facts as factlib, hiring, llm, log, metrics
 from .sources.website import WebsiteFetcher
 
 logger = log.get("dossier")
@@ -168,7 +168,7 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
 
     fetcher = WebsiteFetcher(site_cfg)
     counters = {"checked": 0, "no_site": 0, "unreachable": 0, "classified": 0,
-                "facts": 0, "facts_dropped": 0, "hiring": 0}
+                "facts": 0, "facts_dropped": 0, "hiring": 0, "facts_ok": 0}
     by_type: dict[str, int] = {}
 
     for row in rows:
@@ -227,6 +227,8 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
 
         counters["facts"] += len(site_facts)
         counters["facts_dropped"] += dropped
+        if len(site_facts) >= 2:
+            counters["facts_ok"] += 1
 
         logger.info("%s %s — %s (уверенность %.0f%%): %s",
                     "✓" if site_type in target_types else "·",
@@ -251,6 +253,13 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
             })
 
     if not dry_run:
+        metrics.record(conn, "dossier", {
+            "checked": counters["checked"],
+            "classified": counters["classified"],
+            "with_facts": counters["facts_ok"],
+            "hiring": counters["hiring"],
+            "unreachable": counters["unreachable"],
+        })
         conn.commit()
     conn.close()
 

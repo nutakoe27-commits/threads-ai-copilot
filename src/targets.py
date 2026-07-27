@@ -23,7 +23,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
-from . import contacts, db, log
+from . import contacts, db, log, metrics
 from .providers.checko import BudgetExhausted, CheckoClient, CheckoError, RequestBudget
 
 logger = log.get("targets")
@@ -399,6 +399,17 @@ def enrich(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
     logger.info("Проверено %d: прошло ICP %d, отсеяно %d (сэкономлено запросов на финансы: %d)",
                 counters["checked"], counters["passed"], counters["rejected"],
                 counters["saved_requests"])
+    if not dry_run:
+        conn2 = db.connect()
+        metrics.record(conn2, "targets", {
+            "checked": counters["checked"],
+            "passed": counters["passed"],
+            "rejected": counters["rejected"],
+        })
+        metrics.record(conn2, "checko", {"requests": budget.spent})
+        conn2.commit()
+        conn2.close()
+
     if counters["personal_emails"]:
         logger.info("Личных адресов не сохранено: %d (персональные данные, Р-026)",
                     counters["personal_emails"])

@@ -15,7 +15,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from . import contacts as contactlib, db, hiring as hiringlib, log
+from . import contacts as contactlib, db, hiring as hiringlib, log, \
+    metrics, notify, outreach
 
 logger = log.get("report")
 
@@ -206,6 +207,9 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
           AND COALESCE(letter_status, 'ok') = 'ok'
           AND site_type IN ({placeholders})
           AND last_reported IS NULL
+          -- Отправленные и закрытые в список больше не возвращаются:
+          -- дожимы идут отдельным разделом (DECISIONS.md, Р-041).
+          AND COALESCE(outreach_status, 'new') = 'new'
         ORDER BY
             -- Кто прямо сейчас нанимает в продажи — первыми и всегда.
             -- Это единственное настоящее событие в системе: всё остальное
@@ -223,7 +227,20 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
         (*target_types, limit),
     ).fetchall()
 
-    if not rows:
+    # Дожимы: те, кому первое письмо уже ушло, а ответа нет. Забираются
+    # ДО проверки на пустоту: в день, когда новых компаний не нашлось,
+    # список всё равно должен собраться ради дожимов.
+    followups = conn.execute(
+        """
+        SELECT t.inn, t.step, t.subject, t.body, t.why, c.name, c.contact_email,
+               c.site_url
+        FROM touches t JOIN companies c ON c.inn = t.inn
+        WHERE t.status = 'draft' AND t.step > 1
+        ORDER BY t.step, c.name
+        """
+    ).fetchall()
+
+    if not rows and not followups:
         if thin_rows:
             logger.warning(
                 "Годных писем нет, отложено из-за нехватки фактов: %d. "
@@ -236,10 +253,13 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
         return None
 
     today = date.today().isoformat()
+    total = len(rows) + len(followups)
     lines: list[str] = [
         f"# Утренний список — {today}",
         "",
-        f"Компаний: **{len(rows)}**. Каждое письмо прочитайте и поправьте перед отправкой.",
+        f"Писем: **{total}**"
+        + (f", из них дожимов {len(followups)}" if followups else "")
+        + ". Каждое прочитайте и поправьте перед отправкой.",
         "",
         "> Имя и должность получателя система не хранит и не подставляет — "
         "добавьте руками в почтовом клиенте.",
@@ -340,6 +360,61 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
         )
         lines.append("")
 
+    if followups:
+        lines.append("## Дожимы")
+        lines.append("")
+        lines.append("Этим компаниям письмо уже уходило, ответа не было. "
+                     "Каждое письмо ниже опирается на другой факт, а не "
+                     "повторяет предыдущее.")
+        lines.append("")
+        for index, row in enumerate(followups, start=1):
+            lines.append(f"### {index}. {row['name']} — письмо {row['step']}")
+            lines.append("")
+            if row["why"]:
+                lines.append(f"**Почему сейчас:** {row['why']}")
+                lines.append("")
+            where = []
+            if row["site_url"]:
+                where.append(f"[сайт]({row['site_url']})")
+            if row["contact_email"]:
+                where.append(f"`{row['contact_email']}`")
+            where.append(f"ИНН `{row['inn']}`")
+            lines.append(" · ".join(where))
+            lines.append("")
+            lines.append(f"**Тема:** {row['subject'] or '—'}")
+            lines.append("")
+            lines.append("```")
+            lines.append(row["body"] or "")
+            lines.append("```")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+    # Напоминание про отметку статусов. Без него отметки перестают делать
+    # через две недели, и метрики становятся бессмысленными.
+    all_inns = [row["inn"] for row in rows] + [row["inn"] for row in followups]
+    if all_inns:
+        lines.append("## После отправки")
+        lines.append("")
+        lines.append("Отметьте, что ушло — иначе система не заведёт часы дожима "
+                     "и не посчитает конверсию:")
+        lines.append("")
+        lines.append("```")
+        lines.append("python3 run.py --stage mark sent " + " ".join(all_inns))
+        lines.append("```")
+        lines.append("")
+        lines.append("Когда ответят: `mark replied ИНН`. "
+                     "Если попросили не писать: `mark refused ИНН` — "
+                     "компания уйдёт в стоп-лист навсегда.")
+        lines.append("")
+
+    statuses = outreach.summary(conn)
+    if statuses:
+        lines.append("<sub>В работе: "
+                     + ", ".join(f"{k} — {v}" for k, v in sorted(statuses.items()))
+                     + "</sub>")
+        lines.append("")
+
     problems = log.problems()
     if problems:
         lines.append("## ⚠️ Проблемы прогона")
@@ -359,9 +434,41 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
     # Отложенные тоже помечаем показанными: они попали в хвост отчёта, и
     # каждое утро повторять их незачем. Найти их потом — tools/thin.sql.
     db.mark_reported(conn, [], [row["inn"] for row in rows] + [r["inn"] for r in thin_rows])
+    metrics.record(conn, "morning", {"listed": len(rows) + len(followups),
+                                     "followups": len(followups),
+                                     "held": len(thin_rows)})
     conn.commit()
     conn.close()
 
-    logger.info("Утренний список готов: %s (%d писем, отложено %d)",
-                path, len(rows), len(thin_rows))
+    logger.info("Утренний список готов: %s (%d писем, %d дожимов, отложено %d)",
+                path, len(rows), len(followups), len(thin_rows))
     return path
+
+
+def send_to_telegram(config: dict[str, Any]) -> dict[str, int]:
+    """Отправляет свежий утренний список в Telegram по одной компании.
+
+    Разбивка по компаниям не косметическая: в Telegram блок кода копируется
+    одним нажатием, и письмо должно быть отдельным блоком, а не куском
+    простыни (DECISIONS.md, Р-042).
+    """
+    today = date.today().isoformat()
+    path = MORNING_DIR / f"{today}.md"
+    if not path.exists():
+        logger.warning("Нет файла %s — сначала соберите список: --stage morning", path)
+        return {"sent": 0}
+
+    text = path.read_text(encoding="utf-8")
+
+    # Файл уже размечен заголовками второго уровня по компаниям — этим и режем.
+    parts = text.split("\n## ")
+    header = parts[0].strip()
+    blocks = [f"## {part.strip()}" for part in parts[1:] if part.strip()]
+
+    limit = int(config.get("report", {}).get("telegram_max_blocks", 25))
+    if len(blocks) > limit:
+        logger.warning("Блоков %d, отправлю первые %d — остальное в файле",
+                       len(blocks), limit)
+        blocks = blocks[:limit]
+
+    return notify.send_morning(blocks, header)

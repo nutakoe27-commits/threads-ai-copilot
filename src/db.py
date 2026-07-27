@@ -92,6 +92,39 @@ CREATE TABLE IF NOT EXISTS runs (
     new_signals     INTEGER DEFAULT 0,      -- сколько записано (без дублей)
     problems        INTEGER DEFAULT 0
 );
+
+-- Воронка по дням. Ключ-значение, а не колонки: новая метрика не требует
+-- миграции схемы, а их будет много.
+--
+-- Зачем. Источник редко ломается заметно — он деградирует. trudvsem честно
+-- отдавал 14 131 вакансию, в которых не было ни одной нужной компании.
+-- Формально работал. Без истории воронки такое видно только глазами и только
+-- если посмотреть (DECISIONS.md, Р-039).
+CREATE TABLE IF NOT EXISTS funnel (
+    day             TEXT NOT NULL,
+    stage           TEXT NOT NULL,
+    metric          TEXT NOT NULL,
+    value           REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, stage, metric)
+);
+
+-- История касаний по компании. Нужна для двух вещей сразу: считать, что
+-- реально произошло, и писать дожимы, которые не повторяют первое письмо.
+CREATE TABLE IF NOT EXISTS touches (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    inn             TEXT NOT NULL,
+    step            INTEGER NOT NULL,       -- 1 — первое письмо, 2 — первый дожим
+    subject         TEXT,
+    body            TEXT,
+    why             TEXT,
+    facts           TEXT,
+    status          TEXT NOT NULL DEFAULT 'draft',  -- draft | sent
+    created_at      TEXT NOT NULL,
+    sent_at         TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_touches_inn ON touches(inn);
+CREATE INDEX IF NOT EXISTS idx_touches_status ON touches(status);
 """
 
 
@@ -145,6 +178,18 @@ MIGRATIONS = [
     # текстом говорит «компанию нашла система», и слабый факт опровергает
     # само письмо. См. DECISIONS.md, Р-024.
     ("companies", "letter_status", "TEXT"),
+    # Что с компанией произошло дальше. Проставляется руками через
+    # `run.py --stage mark` (владелец выбрал ручную отметку, Р-040).
+    #   new      — письмо готово, но не отправлено
+    #   sent     — письмо ушло
+    #   replied  — ответили
+    #   meeting  — договорились о разговоре
+    #   refused  — попросили не писать. Такой ИНН уходит в стоп-лист навсегда
+    #   bounced  — адрес не существует
+    ("companies", "outreach_status", "TEXT"),
+    ("companies", "outreach_at", "TEXT"),
+    ("companies", "touch_count", "INTEGER"),
+    ("companies", "last_touch_at", "TEXT"),
 ]
 
 

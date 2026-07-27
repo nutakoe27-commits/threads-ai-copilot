@@ -22,7 +22,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from . import db, facts as factlib, llm, log
+from . import db, facts as factlib, llm, log, metrics, outreach
 
 logger = log.get("compose")
 
@@ -161,6 +161,31 @@ def finish_letter(body: str, origin: str) -> tuple[str, list[str]]:
         notes.append(f"самый длинный абзац — {longest} слов, разбейте его")
 
     return f"{text}\n\n{origin}", notes
+
+
+def build_followup_prompt(site_type: str) -> str:
+    """Промпт дожима: общий бриф плюс правила второго письма.
+
+    Запреты, тон, язык и длина берутся из letter.md без изменений. Меняется
+    только то, что письмо должно сделать: не познакомиться, а дать новую
+    мысль тому, кто уже получил первое (DECISIONS.md, Р-041).
+    """
+    return (build_system_prompt(site_type)
+            + "\n\n---\n\n" + load_prompt("followup.md"))
+
+
+def build_followup_dossier(row: Any, previous: list[Any]) -> str:
+    """Досье для дожима: те же факты плюс то, что уже было написано."""
+    lines = [build_dossier(row), ""]
+    lines.append("=" * 60)
+    lines.append("ЧТО ЭТОЙ КОМПАНИИ УЖЕ ПИСАЛИ. Не повторяй ни мысль, ни "
+                 "формулировки. Возьми другой факт и сделай другой вывод.")
+    for touch in previous:
+        lines.append("")
+        lines.append(f"--- Письмо {touch['step']}, отправлено {(touch['sent_at'] or '')[:10]}")
+        lines.append(f"Тема: {touch['subject']}")
+        lines.append(touch["body"] or "")
+    return "\n".join(lines)
 
 
 def site_facts(row: Any) -> list[str]:
@@ -353,8 +378,19 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
                  json.dumps(facts_used, ensure_ascii=False), status,
                  db.now(), row["inn"]),
             )
+            if not thin:
+                outreach.save_touch(
+                    conn, row["inn"], 1, subject, body,
+                    result.get("why_line", ""),
+                    json.dumps(facts_used, ensure_ascii=False))
 
     if not dry_run:
+        metrics.record(conn, "compose", {
+            "attempted": len(rows),
+            "written": counters["written"],
+            "thin": counters["thin"],
+            "failed": counters["failed"],
+        })
         conn.commit()
     conn.close()
 
@@ -362,4 +398,99 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
                 counters["written"], counters["thin"], counters["failed"])
     if counters["thin"]:
         logger.info("Отложенные письма: sqlite3 data/leads.db < tools/thin.sql")
+    return counters
+
+
+def run_followups(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
+    """Пишет второе и третье письмо тем, кто не ответил.
+
+    Дожим отличается от первого письма одним: он обязан нести новую мысль.
+    Поэтому модель получает не только досье, но и текст того, что уже
+    отправили, с прямым запретом повторяться (DECISIONS.md, Р-041).
+
+    Черновики складываются в историю касаний и попадают в утренний список
+    отдельным разделом. Отправляет их человек, как и первые письма.
+    """
+    followup_cfg = config.get("followup", {})
+    if not followup_cfg.get("enabled", True):
+        logger.info("Дожимы выключены в конфиге (followup.enabled)")
+        return {"written": 0}
+
+    delay_days = int(followup_cfg.get("delay_days", 4))
+    max_touches = int(followup_cfg.get("max_touches", 3))
+    per_run = int(followup_cfg.get("per_run", 10))
+
+    conn = db.connect()
+    rows = outreach.pending_followups(conn, delay_days, max_touches)[:per_run]
+
+    if not rows:
+        logger.info("Дожимать некого. Условия: письмо отправлено, ответа нет, "
+                    "прошло %d дней, касаний меньше %d", delay_days, max_touches)
+        conn.close()
+        return {"written": 0}
+
+    logger.info("Компаний к дожиму: %d (модель %s)", len(rows), llm.MODEL_WRITE)
+
+    try:
+        origin = load_origin()
+    except FileNotFoundError as exc:
+        logger.error("%s", exc)
+        conn.close()
+        return {"written": 0}
+
+    counters = {"written": 0, "failed": 0}
+    for row in rows:
+        name = row["name"]
+        step = int(row["touch_count"] or 1) + 1
+        previous = outreach.previous_touches(conn, row["inn"])
+
+        if not previous:
+            # Письмо отмечено отправленным, но текста в истории нет. Такое
+            # бывает у компаний, обработанных до появления таблицы touches.
+            logger.warning("— %s: нет текста прошлых писем, дожим пропущен", name)
+            continue
+
+        try:
+            result = llm.classify(
+                build_followup_prompt(row["site_type"] or "default"),
+                build_followup_dossier(row, previous),
+                LETTER_SCHEMA, max_tokens=2048, model=llm.MODEL_WRITE,
+            )
+        except llm.LLMUnavailable as exc:
+            logger.error("%s", exc)
+            break
+        except llm.LLMError as exc:
+            counters["failed"] += 1
+            logger.warning("— %s: дожим не написался (%s)", name, exc)
+            continue
+
+        body, notes = finish_letter(result.get("body", ""), origin)
+        for note in notes:
+            logger.warning("  ↳ %s: %s", name, note)
+
+        # Проверка, которой нет у первого письма: не повторяет ли дожим
+        # предыдущее. Сравниваем со всеми уже отправленными текстами.
+        repeated = any(factlib.coverage(factlib.words(body),
+                                        factlib.words(touch["body"] or "")) > 0.6
+                       for touch in previous)
+        if repeated:
+            logger.warning("  ↳ %s: дожим сильно повторяет прошлое письмо", name)
+
+        counters["written"] += 1
+        logger.info("✓ %s — письмо %d: %s", name, step, result.get("subject", ""))
+
+        if not dry_run:
+            outreach.save_touch(
+                conn, row["inn"], step, result.get("subject", ""), body,
+                result.get("why_line", ""),
+                json.dumps(result.get("facts_used") or [], ensure_ascii=False))
+
+    if not dry_run:
+        metrics.record(conn, "followup", {"attempted": len(rows),
+                                          "written": counters["written"]})
+        conn.commit()
+    conn.close()
+
+    logger.info("Дожимов написано: %d, не удалось %d",
+                counters["written"], counters["failed"])
     return counters

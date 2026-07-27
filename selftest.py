@@ -19,12 +19,14 @@ import os
 import sys
 import tempfile
 import zipfile
+from datetime import date, timedelta
 from pathlib import Path
 
 import yaml
 
-from src import (collect, compose, contacts, db, dossier, facts, hiring,
-                 llm, log, report, targets)
+from src import (collect, compose, contacts, db, dossier, facts, guard,
+                 hiring, llm, log, metrics, notify, outreach, report,
+                 targets)
 from src.providers import perplexity
 from src.providers.perplexity import PerplexityClient, PerplexityUnavailable
 from src.sources import website as website_module, zakupki
@@ -848,6 +850,150 @@ def main() -> int:
         "Здравствуйте.\n\n" + "слово " * 60 + "\n\n" + "слово " * 130, origin)
     check("слишком длинное письмо замечено",
           any("длинное" in note for note in notes), str(notes))
+
+    print("\n[30] Воронка: запись, конверсия, ловля деградации")
+    with tempfile.TemporaryDirectory() as tmp:
+        db.DB_PATH = Path(tmp) / "m.db"
+        conn = db.connect()
+
+        metrics.record(conn, "targets", {"checked": 40, "passed": 9})
+        metrics.record(conn, "targets", {"checked": 20, "passed": 5})
+        conn.commit()
+        check("числа за день складываются, а не дублируются",
+              metrics.totals(conn, "targets", "checked", "2000-01-01") == 60.0)
+
+        text = metrics.report(conn, days=14)
+        check("в отчёте есть строка этапа", "прошло ICP" in text, text[:200])
+        check("конверсия посчитана", "23.3%" in text, text[:400])
+
+        # Деградация: на прошлой неделе проходила пятая часть, на этой — сотая.
+        conn.execute("DELETE FROM funnel")
+        old_day = (date.today() - timedelta(days=10)).isoformat()
+        new_day = date.today().isoformat()
+        for day, checked, passed in [(old_day, 200, 40), (new_day, 200, 8)]:
+            for metric, value in (("checked", checked), ("passed", passed)):
+                conn.execute("INSERT INTO funnel (day, stage, metric, value) "
+                             "VALUES (?, 'targets', ?, ?)", (day, metric, value))
+        conn.commit()
+        drops = metrics.check_drops(conn)
+        check("падение конверсии вдвое замечено", len(drops) == 1, str(drops))
+        check("в замечании названы обе цифры",
+              "20%" in drops[0] and "4%" in drops[0], str(drops))
+
+        # На малых числах конверсия скачет сама — молчим, иначе приучим
+        # человека не читать предупреждения.
+        conn.execute("DELETE FROM funnel")
+        for day, checked, passed in [(old_day, 10, 5), (new_day, 10, 1)]:
+            for metric, value in (("checked", checked), ("passed", passed)):
+                conn.execute("INSERT INTO funnel (day, stage, metric, value) "
+                             "VALUES (?, 'targets', ?, ?)", (day, metric, value))
+        conn.commit()
+        check("на малых числах не жалуемся", metrics.check_drops(conn) == [])
+        conn.close()
+
+    print("\n[31] Статусы касаний и стоп-лист")
+    with tempfile.TemporaryDirectory() as tmp:
+        db.DB_PATH = Path(tmp) / "o.db"
+        conn = db.connect()
+        conn.execute("INSERT INTO companies (inn,name,first_seen,last_seen,"
+                     "letter_body) VALUES ('111','ООО ТЕСТ','t','t','письмо')")
+        outreach.save_touch(conn, "111", 1, "тема", "письмо", "почему", "[]")
+        conn.commit()
+        conn.close()
+
+        outreach.mark("sent", ["111"])
+        conn = db.connect()
+        row = conn.execute("SELECT * FROM companies WHERE inn='111'").fetchone()
+        check("статус проставлен", row["outreach_status"] == "sent")
+        check("счётчик касаний вырос", row["touch_count"] == 1)
+        check("часы дожима запущены", row["last_touch_at"] is not None)
+        touch = conn.execute("SELECT * FROM touches WHERE inn='111'").fetchone()
+        check("черновик отмечен отправленным", touch["status"] == "sent")
+
+        # Дожим положен через delay_days, но не раньше.
+        check("сразу после отправки дожимать рано",
+              outreach.pending_followups(conn, delay_days=4, max_touches=3) == [])
+        conn.execute("UPDATE companies SET last_touch_at = "
+                     "datetime('now', '-10 days') WHERE inn='111'")
+        conn.commit()
+        due = outreach.pending_followups(conn, delay_days=4, max_touches=3)
+        check("через десять дней дожим положен", len(due) == 1, str(len(due)))
+        conn.close()
+
+        outreach.mark("refused", ["111"])
+        stoplist = (db.DB_PATH.parent / "stoplist.txt").read_text(encoding="utf-8")
+        check("отказ уходит в стоп-лист файлом", "111" in stoplist, stoplist)
+        conn = db.connect()
+        check("отказавшихся больше не дожимаем",
+              outreach.pending_followups(conn, delay_days=1, max_touches=3) == [])
+        conn.close()
+
+        outreach.mark("sent", ["999"])
+        check("неизвестный ИНН не роняет прогон", True)
+
+    print("\n[32] Защита настроек")
+    icp = yaml.safe_load(Path("config/icp.yaml").read_text(encoding="utf-8"))
+    check("боевой конфиг проходит проверку без жёстких нарушений",
+          all(not v.hard for v in guard.check(icp)),
+          str([str(v) for v in guard.check(icp) if v.hard]))
+
+    broken = yaml.safe_load(Path("config/icp.yaml").read_text(encoding="utf-8"))
+    broken["website"]["pause_seconds"] = 0.1
+    violations = guard.check(broken)
+    check("слишком частые запросы к чужому сайту — жёсткий стоп",
+          any(v.hard and "pause_seconds" in v.setting for v in violations))
+    check("enforce останавливает этап", guard.enforce(broken) is False)
+
+    broken2 = yaml.safe_load(Path("config/icp.yaml").read_text(encoding="utf-8"))
+    broken2["compose"]["per_run"] = 200
+    check("двести писем за прогон — мягкое замечание",
+          any(not v.hard and "per_run" in v.setting for v in guard.check(broken2)))
+    check("мягкое замечание не останавливает этап", guard.enforce(broken2) is True)
+
+    signals_cfg = yaml.safe_load(Path("config/signals.yaml").read_text(encoding="utf-8"))
+    check("ключевые слова не конфликтуют со стоп-словами",
+          guard.check(signals_cfg, kind="signals") == [],
+          str([str(v) for v in guard.check(signals_cfg, kind="signals")]))
+
+    print("\n[33] Telegram: разбивка длинных сообщений")
+    check("короткое сообщение не режется",
+          notify.split_message("коротко") == ["коротко"])
+    long_text = "\n\n".join(["абзац " * 50] * 40)
+    parts = notify.split_message(long_text)
+    check("длинное разбито", len(parts) > 1, str(len(parts)))
+    check("каждая часть влезает в лимит",
+          all(len(p) <= notify.MAX_MESSAGE for p in parts),
+          str([len(p) for p in parts]))
+    check("текст не потерялся при разбивке",
+          sum(p.count("абзац") for p in parts) == long_text.count("абзац"))
+    check("без токена этап пропускается, а не падает",
+          notify.send_morning(["блок"], "шапка").get("skipped") == 1
+          if not os.environ.get("TELEGRAM_BOT_TOKEN") else True)
+
+    print("\n[34] Дожим: промпт и досье с историей")
+    followup_prompt = compose.build_followup_prompt("product")
+    check("дожим наследует общие запреты",
+          "Восклицательных знаков" in followup_prompt)
+    check("дожим запрещает напоминать о себе",
+          "Поднимаю своё письмо наверх" in followup_prompt)
+    check("дожим требует новый угол", "новая мысль, а не напоминание" in followup_prompt)
+    check("дожим короче первого письма", "60–110 слов" in followup_prompt)
+
+    class FakeRow(dict):
+        def __getitem__(self, key):
+            return self.get(key)
+
+    row = FakeRow(name="ООО ТЕСТ", site_facts=json.dumps(["Факт один", "Факт два"]),
+                  site_summary="", site_specialization="", region="Москва",
+                  staff=40, revenue=None, revenue_change_pct=None, okved_name="")
+    previous = [FakeRow(step=1, subject="первая тема",
+                        body="Здравствуйте. Первое письмо про факт один.",
+                        sent_at="2026-07-20")]
+    dossier_text = compose.build_followup_dossier(row, previous)
+    check("в досье дожима есть текст прошлого письма",
+          "Первое письмо про факт один" in dossier_text)
+    check("в досье дожима есть запрет повторяться",
+          "Не повторяй ни мысль" in dossier_text)
 
     print("\n[20] Сквозной прогон: досье → письмо → утренний список")
     with tempfile.TemporaryDirectory() as tmp:

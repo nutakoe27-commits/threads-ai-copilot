@@ -18,7 +18,8 @@ from pathlib import Path
 
 import yaml
 
-from src import collect, compose, dossier, log, report, targets
+from src import (collect, compose, dossier, guard, log, metrics,
+                 outreach, report, targets)
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config" / "signals.yaml"
@@ -55,7 +56,8 @@ def main() -> int:
     parser.add_argument(
         "--stage",
         choices=["targets", "discover", "enrich", "rejudge", "dossier",
-                 "compose", "morning", "cleanup", "collect", "report", "all"],
+                 "compose", "followup", "morning", "telegram", "mark", "stats",
+                 "cleanup", "collect", "report", "all"],
         default="all",
         help=(
             "targets — построить целевой список через Checko (discover + enrich); "
@@ -64,6 +66,10 @@ def main() -> int:
             "dossier — обойти сайты прошедших ICP и классифицировать их; "
             "compose — написать письма по досье; "
             "morning — собрать утренний список с письмами; "
+            "followup — написать дожимы тем, кто не ответил; "
+            "telegram — отправить свежий утренний список в Telegram; "
+            "mark — отметить статус: mark sent ИНН ИНН ...; "
+            "stats — воронка за две недели и самодиагностика; "
             "cleanup — убрать из базы личные адреса, сохранённые до появления фильтра; "
             "collect/report — сбор сигналов и утренний список"
         ),
@@ -77,6 +83,12 @@ def main() -> int:
         help="показать сырой JSON первой вакансии — для сверки имён полей API",
     )
     parser.add_argument("--verbose", action="store_true", help="подробный лог")
+    parser.add_argument("--days", type=int, default=14,
+                        help="глубина отчёта для --stage stats")
+    parser.add_argument(
+        "rest", nargs="*",
+        help="аргументы этапа mark: сначала статус, потом ИНН через пробел",
+    )
     parser.add_argument("--config", type=Path, default=CONFIG_PATH)
     args = parser.parse_args()
 
@@ -86,8 +98,25 @@ def main() -> int:
     logger.info("Запуск: этап=%s dry_run=%s", args.stage, args.dry_run)
 
     try:
+        if args.stage == "stats":
+            return 0 if metrics.run(args.days) == 0 else 0
+
+        if args.stage == "mark":
+            if len(args.rest) < 2:
+                print("Как пользоваться:", file=sys.stderr)
+                print("  python3 run.py --stage mark sent 7703283933 5018046069",
+                      file=sys.stderr)
+                print("\nСтатусы:", file=sys.stderr)
+                for name, meaning in outreach.STATUSES.items():
+                    print(f"  {name:<9} — {meaning}", file=sys.stderr)
+                return 1
+            outreach.mark(args.rest[0], args.rest[1:], dry_run=args.dry_run)
+            return 0
+
         if args.stage in ("targets", "discover", "enrich", "rejudge"):
             icp_config = load_config(ICP_CONFIG_PATH)
+            if not guard.enforce(icp_config):
+                return 2
             if args.stage == "rejudge":
                 targets.rejudge(icp_config, dry_run=args.dry_run)
             else:
@@ -100,18 +129,37 @@ def main() -> int:
             targets.cleanup_contacts(dry_run=args.dry_run)
 
         if args.stage == "dossier":
-            dossier.run(load_config(ICP_CONFIG_PATH), dry_run=args.dry_run)
+            icp_config = load_config(ICP_CONFIG_PATH)
+            if not guard.enforce(icp_config):
+                return 2
+            dossier.run(icp_config, dry_run=args.dry_run)
 
         if args.stage == "compose":
-            compose.run(load_config(ICP_CONFIG_PATH), dry_run=args.dry_run)
+            icp_config = load_config(ICP_CONFIG_PATH)
+            if not guard.enforce(icp_config):
+                return 2
+            compose.run(icp_config, dry_run=args.dry_run)
+
+        if args.stage == "followup":
+            icp_config = load_config(ICP_CONFIG_PATH)
+            if not guard.enforce(icp_config):
+                return 2
+            compose.run_followups(icp_config, dry_run=args.dry_run)
+
+        if args.stage == "telegram":
+            report.send_to_telegram(load_config(ICP_CONFIG_PATH))
 
         if args.stage == "morning":
-            path = report.build_morning(load_config(ICP_CONFIG_PATH), dry_run=args.dry_run)
+            icp_config = load_config(ICP_CONFIG_PATH)
+            path = report.build_morning(icp_config, dry_run=args.dry_run)
             if path:
                 logger.info("Открыть список: %s", path)
+                if icp_config.get("report", {}).get("telegram", True):
+                    report.send_to_telegram(icp_config)
 
         if args.stage in ("collect", "all"):
             config = load_config(args.config)
+            guard.enforce(config, kind="signals")
             collect.run(config, dry_run=args.dry_run, raw=args.raw)
 
         if args.stage in ("report", "all"):
