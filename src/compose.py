@@ -74,6 +74,51 @@ def build_system_prompt(site_type: str) -> str:
     )
 
 
+def load_origin() -> str:
+    """Концовка письма: откуда оно и подпись. Дословно из конфига.
+
+    Комментарии в начале файла (HTML-вида) выбрасываются — они для человека,
+    а не для письма.
+    """
+    text = load_prompt("origin.md")
+    while "<!--" in text and "-->" in text:
+        head, _, rest = text.partition("<!--")
+        _, _, tail = rest.partition("-->")
+        text = head + tail
+    return text.strip()
+
+
+def finish_letter(body: str, origin: str) -> tuple[str, list[str]]:
+    """Дописывает концовку и проверяет письмо механически.
+
+    Всё, что здесь проверяется, — не про вкус, а про соблюдение прямых
+    запретов. Просить модель об этом бесполезно: подпись она теряла три
+    прогона подряд, а описание системы сочиняла каждый раз заново.
+    Возвращает готовый текст и список замечаний для человека.
+    """
+    text = (body or "").strip()
+    notes: list[str] = []
+
+    # Модель иногда всё-таки дописывает своё «письмо пришло из системы...»
+    # вопреки запрету. Обрезаем всё после последнего вопроса: письмо должно
+    # заканчиваться вопросом, дальше идёт только наша концовка.
+    position = text.rfind("?")
+    if position == -1:
+        notes.append("в письме нет вопроса — проверьте, чем оно заканчивается")
+    else:
+        tail = text[position + 1:].strip()
+        if tail:
+            notes.append("после вопроса был лишний текст, он убран")
+        text = text[: position + 1].strip()
+
+    if "!" in text:
+        notes.append("в тексте есть восклицательный знак — уберите руками")
+    if not text.lower().startswith("здравствуйте"):
+        notes.append("письмо не начинается с приветствия")
+
+    return f"{text}\n\n{origin}", notes
+
+
 def site_facts(row: Any) -> list[str]:
     """Проверенные факты с сайта компании. На них строится наблюдение."""
     try:
@@ -168,7 +213,14 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
         conn.close()
         return {"written": 0}
 
-    logger.info("Компаний к написанию письма: %d", len(rows))
+    logger.info("Компаний к написанию письма: %d (модель %s)", len(rows), llm.MODEL_WRITE)
+
+    try:
+        origin = load_origin()
+    except FileNotFoundError as exc:
+        logger.error("%s", exc)
+        conn.close()
+        return {"written": 0}
 
     counters = {"written": 0, "failed": 0, "thin": 0}
     for row in rows:
@@ -198,7 +250,7 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
 
         try:
             result = llm.classify(system_prompt, build_dossier(row), LETTER_SCHEMA,
-                                  max_tokens=2048)
+                                  max_tokens=2048, model=llm.MODEL_WRITE)
         except llm.LLMUnavailable as exc:
             logger.error("%s", exc)
             break
@@ -207,7 +259,9 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
             logger.warning("— %s: письмо не написалось (%s)", name, exc)
             continue
 
-        body = result.get("body", "")
+        body, notes = finish_letter(result.get("body", ""), origin)
+        for note in notes:
+            logger.warning("  ↳ %s: %s", name, note)
 
         # Проверку считаем сами. Список `facts_used`, который возвращает
         # модель, — это её самоотчёт: в него попадает то, что она собиралась

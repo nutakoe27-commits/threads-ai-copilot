@@ -196,7 +196,8 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
 
         try:
             verdict = llm.classify(
-                system_prompt, build_user_content(row, result["text"]), CLASSIFY_SCHEMA
+                system_prompt, build_user_content(row, result["text"]),
+                CLASSIFY_SCHEMA, model=llm.MODEL_EXTRACT,
             )
         except llm.LLMUnavailable as exc:
             # Нет ключа — это не авария прогона, но дальше идти бессмысленно.

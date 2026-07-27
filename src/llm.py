@@ -5,9 +5,17 @@
 переход на GigaChat или YandexGPT не потребует переписывать конвейер
 (DECISIONS.md, Р-005).
 
-Модели:
-  * claude-haiku-4-5 — классификация (дёшево, много вызовов);
-  * claude-sonnet-5  — генерация письма (качество русского текста важнее цены).
+Модели подобраны по цене ошибки, а не по цене запроса:
+
+  * claude-haiku-4-5 — простые переборы, где ошибка ничего не стоит;
+  * claude-sonnet-5  — досье: качество фактов задаёт качество всего дальше;
+  * claude-opus-5    — письмо: его читает живой человек, и второго шанса нет.
+
+ИСТОРИЯ ОДНОЙ ОШИБКИ. До 2026-07-27 письма писал Haiku: `compose` вызывал
+`classify()` ради схемы ответа, а модель в ней была зашита намертво.
+Функция `write()` с более сильной моделью не вызывалась ни разу.
+Отсюда и лесть вместо наблюдений, и выдуманные описания системы
+(DECISIONS.md, Р-031). Теперь модель — параметр, а не константа внутри.
 """
 
 from __future__ import annotations
@@ -21,7 +29,8 @@ from . import log
 logger = log.get("llm")
 
 MODEL_CLASSIFY = "claude-haiku-4-5"
-MODEL_WRITE = "claude-sonnet-5"
+MODEL_EXTRACT = "claude-sonnet-5"
+MODEL_WRITE = "claude-opus-5"
 
 
 class LLMError(RuntimeError):
@@ -49,16 +58,23 @@ def _client() -> Any:
 
 
 def classify(system_prompt: str, user_content: str, schema: dict[str, Any],
-             max_tokens: int = 1024) -> dict[str, Any]:
-    """Классификация со строгой схемой ответа.
+             max_tokens: int = 1024, model: str | None = None) -> dict[str, Any]:
+    """Ответ по строгой схеме. Модель задаёт вызывающий.
 
     Схема гарантирует, что модель вернёт валидный JSON нужной формы —
     разбирать свободный текст и угадывать формат не приходится.
+
+    `model` обязателен по смыслу, хотя и не по сигнатуре: значение по
+    умолчанию — самая дешёвая модель, и именно из-за него письма полгода
+    писал Haiku. Каждый вызывающий указывает модель явно.
     """
     client = _client()
+    chosen = model or MODEL_CLASSIFY
+    logger.debug("Запрос к %s, схема из %d полей",
+                 chosen, len(schema.get("properties", {})))
     try:
         response = client.messages.create(
-            model=MODEL_CLASSIFY,
+            model=chosen,
             max_tokens=max_tokens,
             system=system_prompt,
             messages=[{"role": "user", "content": user_content}],

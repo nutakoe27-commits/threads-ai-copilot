@@ -688,12 +688,15 @@ def main() -> int:
     frame = compose.load_prompt("letter.md")
     check("в каркасе есть приветствие", "Здравствуйте." in frame)
     check("в каркасе есть подпись", "Михаил" in frame)
-    check("вопрос запрещено переписывать",
-          "слово в слово" in frame)
+    check("смысл вопроса задан жёстко, формулировка свободна",
+          "Смысл вопроса задан жёстко, формулировка — нет" in frame)
+    check("запрещены слова из презентаций в вопросе",
+          "«идеальный клиент», «целевая аудитория»" in frame)
+    check("запрещена лесть в наблюдении", "не хвали" in frame)
     check("запрещён пересказ того, что адресат знает сам",
           "не пересказывай то, что адресат знает сам" in frame.lower())
-    check("запрещено копировать формулировку про систему",
-          "Не копируй формулировки из этой инструкции" in frame)
+    check("строку про систему и подпись модель не пишет",
+          "не пиши**: их подставляет система" in frame)
     check("запрещено упоминать деньги компании",
           "о деньгах компании в письме нет ни слова" in frame.lower())
     check("строчные буквы разрешены только в теме",
@@ -775,6 +778,52 @@ def main() -> int:
                   lambda: PerplexityClient().ask("s", "q"))
           if not os.environ.get("PERPLEXITY_API_KEY") else True)
 
+    print("\n[28] Модели: письмо пишет не самая дешёвая")
+    check("для письма задана отдельная модель", llm.MODEL_WRITE != llm.MODEL_CLASSIFY)
+    check("для досье задана отдельная модель", llm.MODEL_EXTRACT != llm.MODEL_CLASSIFY)
+    check("письмо пишет Opus", llm.MODEL_WRITE == "claude-opus-5", llm.MODEL_WRITE)
+    check("досье собирает Sonnet", llm.MODEL_EXTRACT == "claude-sonnet-5", llm.MODEL_EXTRACT)
+    # Регрессия Р-031: compose вызывал classify() ради схемы, а модель в ней
+    # была зашита намертво, и письма полгода писал Haiku.
+    src = Path("src/compose.py").read_text(encoding="utf-8")
+    check("compose явно указывает модель", "model=llm.MODEL_WRITE" in src)
+    src_dossier = Path("src/dossier.py").read_text(encoding="utf-8")
+    check("dossier явно указывает модель", "model=llm.MODEL_EXTRACT" in src_dossier)
+
+    print("\n[29] Концовка письма подставляется кодом, а не моделью")
+    origin = compose.load_origin()
+    check("комментарии из файла выброшены", "<!--" not in origin and "-->" not in origin)
+    check("в концовке есть подпись", origin.strip().endswith("Михаил"), origin)
+    check("концовка короткая", len(origin.splitlines()) <= 5, origin)
+
+    finished, notes = compose.finish_letter(
+        "Здравствуйте.\n\nУ вас модуль под композиты.\n\nКто из ваших клиентов "
+        "за последний год оказался самым удачным?", origin)
+    check("концовка приклеена", finished.endswith(origin), finished)
+    check("у чистого письма замечаний нет", notes == [], str(notes))
+
+    # Главное: модель дописала своё описание системы, и оно враньё.
+    # Настоящий текст из прогона 2026-07-27.
+    invented = ("Здравствуйте.\n\nУ вас есть решения для критической инфраструктуры.\n\n"
+                "Кто из ваших клиентов оказался самым удачным?\n\n"
+                "Письмо пришло из системы, которая отслеживает, как компании "
+                "из ниши критической инфраструктуры берут новые проекты.")
+    finished, notes = compose.finish_letter(invented, origin)
+    check("выдуманное описание системы отрезано",
+          "отслеживает" not in finished, finished)
+    check("про лишний текст сказано человеку",
+          any("лишний текст" in note for note in notes), str(notes))
+    check("правдивая концовка на месте", finished.endswith(origin))
+
+    _, notes = compose.finish_letter("Здравствуйте.\n\nОтличная компания!", origin)
+    check("восклицательный знак замечен",
+          any("восклицательный" in note for note in notes), str(notes))
+    check("отсутствие вопроса замечено",
+          any("нет вопроса" in note for note in notes), str(notes))
+    _, notes = compose.finish_letter("Вы делаете софт. Кто ваш лучший клиент?", origin)
+    check("отсутствие приветствия замечено",
+          any("приветствия" in note for note in notes), str(notes))
+
     print("\n[20] Сквозной прогон: досье → письмо → утренний список")
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -852,7 +901,9 @@ def main() -> int:
         # Подменяем модель: сквозной прогон не должен ходить в сеть.
         captured: dict = {}
 
-        def fake_classify(system_prompt, user_content, schema, max_tokens=1024):
+        def fake_classify(system_prompt, user_content, schema,
+                          max_tokens=1024, model=None):
+            captured.setdefault("models", set()).add(model)
             # Ключуем по компании: иначе второй вызов затирает первый и
             # проверка «дошёл ли нужный угол» становится бессмысленной.
             key = ("пусто" if "ПУСТО" in user_content
@@ -864,7 +915,8 @@ def main() -> int:
                     "subject": "про ваши кейсы со складским учётом",
                     "body": ("Здравствуйте.\n\nВижу, вы ищете людей на холодные "
                              "звонки, и у вас кейсы по автоматизации складского "
-                             "учёта для сетей.\n\nМихаил"),
+                             "учёта для сетей.\n\nКто из ваших клиентов за "
+                             "последний год оказался самым удачным?"),
                     "why_line": "нанимают в продажи прямо сейчас",
                     "facts_used": [],
                 }
@@ -872,7 +924,8 @@ def main() -> int:
                 # Письмо ни на что не опирается, но модель заявляет обратное.
                 return {
                     "subject": "вопрос про ваших клиентов",
-                    "body": "Здравствуйте.\n\nВы занимаетесь разработкой.\n\nМихаил",
+                    "body": ("Здравствуйте.\n\nВы занимаетесь разработкой.\n\n"
+                             "Кто из ваших клиентов оказался самым удачным?"),
                     "why_line": "IT-компания подходящего размера",
                     "facts_used": ["Продукт ParsecNET для контроля доступа",
                                    "Проекты для государственных заказчиков"],
@@ -880,7 +933,8 @@ def main() -> int:
             return {
                 "subject": "про ваш учебный центр для декларантов",
                 "body": ("Здравствуйте.\n\nУ вас Альта-ГТД и собственный учебный "
-                         "центр, где вы обучаете декларантов.\n\nМихаил"),
+                         "центр, где вы обучаете декларантов.\n\nКто из ваших "
+                         "клиентов за последний год оказался самым удачным?"),
                 "why_line": "продуктовая компания с чётким ICP, выручка растёт",
                 "facts_used": ["Продукт «Альта-ГТД» для подачи деклараций"],
             }
@@ -892,6 +946,8 @@ def main() -> int:
         finally:
             llm.classify = original
 
+        check("письма ушли в сильную модель, а не в дешёвую",
+              captured.get("models") == {llm.MODEL_WRITE}, str(captured.get("models")))
         check("годные письма написаны", result["written"] == 2, str(result))
         check("письма без опоры на факты отложены", result["thin"] == 2, str(result))
         check("вакансия дошла до модели как факт досье",
