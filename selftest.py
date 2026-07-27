@@ -13,21 +13,38 @@
 
 from __future__ import annotations
 
+import io
 import json
+import os
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 import yaml
 
-from src import (collect, compose, contacts, db, dossier, facts, llm, log,
-                 report, targets)
+from src import (collect, compose, contacts, db, dossier, facts, hiring,
+                 llm, log, report, targets)
+from src.providers import perplexity
+from src.providers.perplexity import PerplexityClient, PerplexityUnavailable
+from src.sources import website as website_module, zakupki
 from src.providers.checko import CheckoClient, RequestBudget, deep_pick, to_number
 from src.sources import trudvsem as trudvsem_module
 from src.sources.website import _TextExtractor, WebsiteFetcher, normalize_url
 from src.sources.trudvsem import TrudvsemClient, TrudvsemError
 
 FAILURES: list[str] = []
+
+
+def _raises(exception: type[BaseException], call) -> bool:
+    """Поднимает ли вызов именно это исключение. Для проверок обработки ошибок."""
+    try:
+        call()
+    except exception:
+        return True
+    except Exception:  # noqa: BLE001 — другое исключение это тоже провал
+        return False
+    return False
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
@@ -652,6 +669,82 @@ def main() -> int:
     check("строчные буквы разрешены только в теме",
           "На текст письма это не распространяется" in frame)
 
+    print("\n[25] Сигнал найма со страницы вакансий компании")
+    kw = yaml.safe_load(Path("config/signals.yaml").read_text(encoding="utf-8"))["keywords"]
+    career_page = (
+        "Вакансии компании. Менеджер по продажам B2B. Обязанности: холодные "
+        "звонки по базе, поиск новых клиентов, ведение CRM. Требования: опыт "
+        "от двух лет. Также открыта позиция руководитель отдела продаж."
+    )
+    signals = hiring.find_signals(career_page, kw)
+    kinds = {s["strength"] for s in signals}
+    check("сильный сигнал найден", "strong" in kinds, str(signals))
+    check("сигнал по должностям найден", "normal" in kinds, str(signals))
+    check("у каждого сигнала есть цитата со страницы",
+          all(s["quote"] for s in signals), str(signals))
+    check("цитаты действительно есть на странице",
+          all(facts.quote_found(s["quote"], career_page) for s in signals))
+    check("описание сигнала человеческое",
+          hiring.describe(signals) == "прямо сейчас нанимают людей на холодный поиск клиентов",
+          hiring.describe(signals))
+
+    # Та же ловушка, что и в Р-011: стоп-слово внутри длинного слова.
+    check("«рукоВОДИТЕЛЬ отдела продаж» не путается с водителем",
+          any("руководитель отдела продаж" in s["fact"] for s in signals), str(signals))
+    check("пустая страница не даёт сигналов", hiring.find_signals("", kw) == [])
+    check("страница без продаж не даёт сигналов",
+          hiring.find_signals("Вакансия: инженер-конструктор, работа с чертежами", kw) == [])
+
+    check("пути к вакансиям заданы отдельно от описания",
+          "/career" in website_module.CAREER_PATHS
+          and "/career" not in website_module.CANDIDATE_PATHS)
+
+    print("\n[26] Госзакупки: разбор архива контрактов")
+    xml = (
+        "<contract><suppliers><supplier><inn>7722260272</inn>"
+        "<name>ООО МДО</name></supplier></suppliers>"
+        "<price>12500000.00</price><endDate>2026-12-31</endDate></contract>"
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        zf.writestr("contract_1.xml", xml)
+        zf.writestr("readme.txt", "не XML, должен быть пропущен")
+    archive = buffer.getvalue()
+
+    contracts = list(zakupki.iter_contracts(archive))
+    check("контракт разобран", len(contracts) == 1, str(len(contracts)))
+    check("ИНН поставщика найден", "7722260272" in contracts[0]["inns"])
+    check("дата окончания разобрана", contracts[0]["end_date"] == "2026-12-31")
+    check("сумма разобрана", contracts[0]["price"] == 12500000.0)
+
+    measured = zakupki.measure_coverage([archive], {"7722260272", "5018046069"})
+    check("покрытие посчитано верно", measured["coverage"] == 0.5, str(measured["coverage"]))
+    check("найденная компания попала в результат", "7722260272" in measured["matched"])
+    check("объём просмотренного виден", measured["contracts"] == 1)
+    check("битый архив даёт понятную ошибку",
+          _raises(zakupki.ZakupkiError,
+                  lambda: list(zakupki.iter_contracts(b"not a zip archive"))))
+
+    print("\n[27] Perplexity: разбор ответа")
+    check("текст ответа достаётся",
+          perplexity.extract_text(
+              {"choices": [{"message": {"content": "ответ"}}]}) == "ответ")
+    check("пустая структура не роняет разбор",
+          perplexity.extract_text({}) == "")
+    check("ссылки из citations-строк",
+          perplexity.extract_urls({"citations": ["https://a.ru"]}) == ["https://a.ru"])
+    check("ссылки из search_results-словарей",
+          perplexity.extract_urls(
+              {"search_results": [{"url": "https://b.ru"}]}) == ["https://b.ru"])
+    check("дубли ссылок схлопываются",
+          perplexity.extract_urls({"citations": ["https://a.ru"],
+                                   "search_results": [{"url": "https://a.ru"}]})
+          == ["https://a.ru"])
+    check("без ключа поднимается понятная ошибка",
+          _raises(PerplexityUnavailable,
+                  lambda: PerplexityClient().ask("s", "q"))
+          if not os.environ.get("PERPLEXITY_API_KEY") else True)
+
     print("\n[20] Сквозной прогон: досье → письмо → утренний список")
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -686,6 +779,20 @@ def main() -> int:
             "'outsourcing',0.5,'IT-компания',"
             "'[\"Продукт ParsecNET для контроля доступа\", "
             "\"Проекты для государственных заказчиков\"]','t')")
+        # Четвёртая: нанимает в продажи. Единственное событие в выборке,
+        # поэтому в утреннем списке должна оказаться выше всех.
+        conn.execute(
+            "INSERT INTO companies (inn,name,first_seen,last_seen,region,"
+            "okved,okved_name,staff,revenue,icp_status,checked_at,site_url,"
+            "site_type,site_confidence,site_summary,site_facts,site_hiring,"
+            "site_checked_at) "
+            "VALUES ('7704','ООО \"НАНИМАЮТ\"','t','t','Москва','62.01',"
+            "'Разработка ПО',45,150e6,'passed','t','https://naimut.ru',"
+            "'outsourcing',0.8,'Разработка на заказ для ритейла',"
+            "'[\"На странице вакансий ищут людей на «холодные звонки»\", "
+            "\"Кейсы по автоматизации складского учёта для сетей\"]',"
+            "'[{\"fact\": \"На странице вакансий ищут людей на «холодные звонки»\", "
+            "\"quote\": \"холодные звонки по базе\", \"strength\": \"strong\"}]','t')")
         # Третья: фактов нет вовсе — модель не должна вызываться совсем.
         conn.execute(
             "INSERT INTO companies (inn,name,first_seen,last_seen,region,"
@@ -719,8 +826,18 @@ def main() -> int:
             # Ключуем по компании: иначе второй вызов затирает первый и
             # проверка «дошёл ли нужный угол» становится бессмысленной.
             key = ("пусто" if "ПУСТО" in user_content
-                   else "общее" if "ОБЩЕЕ" in user_content else "альта")
+                   else "общее" if "ОБЩЕЕ" in user_content
+                   else "найм" if "НАНИМАЮТ" in user_content else "альта")
             captured[key] = {"system": system_prompt, "user": user_content}
+            if key == "найм":
+                return {
+                    "subject": "про ваши кейсы со складским учётом",
+                    "body": ("Здравствуйте.\n\nВижу, вы ищете людей на холодные "
+                             "звонки, и у вас кейсы по автоматизации складского "
+                             "учёта для сетей.\n\nМихаил"),
+                    "why_line": "нанимают в продажи прямо сейчас",
+                    "facts_used": [],
+                }
             if key == "общее":
                 # Письмо ни на что не опирается, но модель заявляет обратное.
                 return {
@@ -745,8 +862,13 @@ def main() -> int:
         finally:
             llm.classify = original
 
-        check("годное письмо написано", result["written"] == 1, str(result))
+        check("годные письма написаны", result["written"] == 2, str(result))
         check("письма без опоры на факты отложены", result["thin"] == 2, str(result))
+        check("вакансия дошла до модели как факт досье",
+              "холодные звонки" in captured.get("найм", {}).get("user", ""),
+              captured.get("найм", {}).get("user", ""))
+        check("промпт велит брать вакансию первой",
+              "бери её первой" in captured.get("найм", {}).get("system", ""))
         check("компания без фактов до модели не дошла",
               "пусто" not in captured, str(sorted(captured)))
         check("модель получила угол для продуктовой компании",
@@ -789,6 +911,13 @@ def main() -> int:
                   "Отложено" in text and "ОБЩЕЕ" in text and "ПУСТО" in text, text)
             check("общий адрес показан без предупреждения",
                   "`info@alta.ru`" in text and "info@alta.ru — ⚠️" not in text, text)
+            # Событие важнее всего остального: компания, которая нанимает,
+            # должна стоять выше продуктовой, хотя обычно порядок обратный.
+            check("нанимающая компания стоит первой в списке",
+                  text.index("НАНИМАЮТ") < text.index("АЛЬТА-СОФТ"), text[:600])
+            check("событие показано отдельной строкой",
+                  "**Событие:** прямо сейчас нанимают людей на холодный поиск" in text,
+                  text[:900])
 
         check("повторный список пуст", report.build_morning(icp_full) is None)
 

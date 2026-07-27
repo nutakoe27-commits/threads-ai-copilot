@@ -15,7 +15,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from . import contacts as contactlib, db, log
+from . import contacts as contactlib, db, hiring as hiringlib, log
 
 logger = log.get("report")
 
@@ -207,7 +207,13 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
           AND site_type IN ({placeholders})
           AND last_reported IS NULL
         ORDER BY
-            -- Продуктовые компании первыми: у них ICP острее, и система
+            -- Кто прямо сейчас нанимает в продажи — первыми и всегда.
+            -- Это единственное настоящее событие в системе: всё остальное
+            -- (выручка, описание, ОКВЭД) — состояние, а не повод написать
+            -- сегодня. См. DECISIONS.md, Р-027.
+            CASE WHEN site_hiring IS NOT NULL AND site_hiring NOT IN ('', '[]')
+                 THEN 0 ELSE 1 END,
+            -- Продуктовые компании следом: у них ICP острее, и система
             -- показывает себя на них лучше всего (DECISIONS.md, Р-020).
             CASE WHEN site_type = 'product' THEN 0 ELSE 1 END,
             CASE WHEN revenue_change_pct IS NULL THEN 1 ELSE 0 END,
@@ -248,9 +254,21 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
         except (json.JSONDecodeError, TypeError):
             facts = []
 
-        lines.append(f"## {index}. {row['name']}")
+        try:
+            hiring_signals = json.loads(row["site_hiring"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            hiring_signals = []
+
+        marker = "⚑ " if hiring_signals else ""
+        lines.append(f"## {index}. {marker}{row['name']}")
         lines.append("")
         lines.append(f"**Почему здесь:** {row['letter_why'] or '—'}")
+        if hiring_signals:
+            # Событие показываем отдельной строкой: это единственное «сегодня»,
+            # которое у письма есть, и решение писать первым делом опирается
+            # именно на него.
+            lines.append("")
+            lines.append(f"**Событие:** {hiringlib.describe(hiring_signals)}")
         lines.append("")
 
         details = [TYPE_LABELS.get(row["site_type"], row["site_type"] or "—")]

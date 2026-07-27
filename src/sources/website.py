@@ -36,6 +36,16 @@ CANDIDATE_PATHS = [
     "/services", "/uslugi", "/what-we-do", "/solutions",
 ]
 
+# Страницы вакансий. Собираются отдельно от описания компании: то, что
+# компания ищет продажников, — это событие с датой, а не описание бизнеса.
+# Исходная идея с вакансиями (DECISIONS.md, Р-001) умерла вместе с hh.ru,
+# но на собственном сайте компании она полностью законна — мы и так сюда
+# ходим и соблюдаем их robots.txt.
+CAREER_PATHS = [
+    "/career", "/careers", "/vacancy", "/vacancies", "/jobs", "/job",
+    "/rabota", "/vakansii", "/team/career", "/about/career",
+]
+
 MAX_PAGES = 4
 MAX_BYTES = 500_000
 MAX_TEXT_CHARS = 12_000
@@ -91,6 +101,7 @@ class WebsiteFetcher:
         self.timeout = int(config.get("timeout_seconds", 15))
         self.pause = float(config.get("pause_seconds", 2.0))
         self.max_pages = int(config.get("max_pages", MAX_PAGES))
+        self.career_pages = int(config.get("career_pages", 2))
         contact = config.get("contact", "")
         self.user_agent = (
             f"leadgen-research/0.1 (+{contact})" if contact
@@ -186,11 +197,40 @@ class WebsiteFetcher:
         base_url = reachable
 
         robots, delay = self._robots(base_url)
+
+        collected, visited = self._read_pages(
+            base_url, CANDIDATE_PATHS, robots, delay, self.max_pages)
+
+        # Вакансии добираем отдельным небольшим бюджетом: даже если описание
+        # компании собралось с первой страницы, страницу вакансий стоит
+        # посмотреть — это единственный событийный сигнал, который у нас есть.
+        hiring, hiring_pages = self._read_pages(
+            base_url, CAREER_PATHS, robots, delay, self.career_pages)
+
+        if not collected:
+            # Частый случай — сайт собран на JavaScript: сервер отдаёт пустой
+            # каркас, а текст дорисовывается в браузере. Читать такие мы не
+            # умеем и не будем: headless-браузер сильно усложнит систему.
+            return {"ok": False,
+                    "reason": "страницы открылись, но текста нет "
+                              "(вероятно, сайт собирается скриптами в браузере)",
+                    "text": "", "pages": [], "hiring_text": "", "hiring_pages": []}
+
+        combined = " ".join(collected)[:MAX_TEXT_CHARS]
+        return {"ok": True, "reason": "", "text": combined, "pages": visited,
+                "hiring_text": " ".join(hiring)[:MAX_TEXT_CHARS],
+                "hiring_pages": hiring_pages,
+                "base_url": base_url}
+
+    def _read_pages(self, base_url: str, paths: list[str],
+                    robots: urllib.robotparser.RobotFileParser | None,
+                    delay: float, budget: int) -> tuple[list[str], list[str]]:
+        """Читает страницы по списку путей, пока не кончится бюджет."""
         collected: list[str] = []
         visited: list[str] = []
 
-        for path in CANDIDATE_PATHS:
-            if len(visited) >= self.max_pages:
+        for path in paths:
+            if len(visited) >= budget:
                 break
             url = urljoin(base_url, path) if path else base_url
 
@@ -226,15 +266,4 @@ class WebsiteFetcher:
                 collected.append(text)
                 visited.append(url)
 
-        if not collected:
-            # Частый случай — сайт собран на JavaScript: сервер отдаёт пустой
-            # каркас, а текст дорисовывается в браузере. Читать такие мы не
-            # умеем и не будем: headless-браузер сильно усложнит систему.
-            return {"ok": False,
-                    "reason": "страницы открылись, но текста нет "
-                              "(вероятно, сайт собирается скриптами в браузере)",
-                    "text": "", "pages": []}
-
-        combined = " ".join(collected)[:MAX_TEXT_CHARS]
-        return {"ok": True, "reason": "", "text": combined, "pages": visited,
-                "base_url": base_url}
+        return collected, visited

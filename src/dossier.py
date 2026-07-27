@@ -15,7 +15,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from . import db, facts as factlib, llm, log
+import yaml
+
+from . import db, facts as factlib, hiring, llm, log
 from .sources.website import WebsiteFetcher
 
 logger = log.get("dossier")
@@ -97,6 +99,21 @@ def load_prompt(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
+def load_keywords() -> dict[str, list[str]]:
+    """Ключевые слова для сигнала найма — из того же signals.yaml.
+
+    Списки специально не дублируются: они уже отлажены на четырнадцати
+    тысячах вакансий, и держать вторую копию значит однажды поправить
+    только одну из них.
+    """
+    path = PROMPTS_DIR.parent / "signals.yaml"
+    if not path.exists():
+        logger.warning("Нет %s — сигнал найма отключён", path)
+        return {}
+    with path.open(encoding="utf-8") as handle:
+        return (yaml.safe_load(handle) or {}).get("keywords", {}) or {}
+
+
 def build_user_content(company: Any, site_text: str) -> str:
     """Собирает то, что видит модель: реестровые факты плюс текст сайта."""
     facts = [f"Название: {company['name']}"]
@@ -147,10 +164,11 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
         return {"checked": 0}
 
     target_types = site_cfg.get("target_types") or ["outsourcing", "staffing"]
+    keywords = load_keywords()
 
     fetcher = WebsiteFetcher(site_cfg)
     counters = {"checked": 0, "no_site": 0, "unreachable": 0, "classified": 0,
-                "facts": 0, "facts_dropped": 0}
+                "facts": 0, "facts_dropped": 0, "hiring": 0}
     by_type: dict[str, int] = {}
 
     for row in rows:
@@ -196,6 +214,16 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
         by_type[site_type] = by_type.get(site_type, 0) + 1
 
         site_facts, dropped = verify_facts(verdict.get("facts"), result["text"])
+
+        # Вакансии на их же сайте. Сверять цитатой не нужно: мы нашли
+        # совпадение сами, в скачанном тексте, без участия модели.
+        hiring_signals = hiring.find_signals(result.get("hiring_text", ""), keywords)
+        if hiring_signals:
+            counters["hiring"] += 1
+            for signal in hiring_signals:
+                logger.info("      ⚑ %s", signal["fact"])
+            site_facts = [s["fact"] for s in hiring_signals] + site_facts
+
         counters["facts"] += len(site_facts)
         counters["facts_dropped"] += dropped
 
@@ -218,6 +246,7 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
                 "site_specialization": json.dumps(
                     verdict.get("specialization", []), ensure_ascii=False),
                 "site_facts": json.dumps(site_facts, ensure_ascii=False),
+                "site_hiring": json.dumps(hiring_signals, ensure_ascii=False),
             })
 
     if not dry_run:
@@ -233,6 +262,9 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
                     "не подтвердилось цитатой %d",
                     counters["facts"], counters["facts"] / counters["classified"],
                     counters["facts_dropped"])
+        logger.info("Нанимают в продажи прямо сейчас: %d из %d — "
+                    "это единственный событийный сигнал, который у нас есть",
+                    counters["hiring"], counters["classified"])
     if by_type:
         logger.info("--- Кто это оказался:")
         for site_type, count in sorted(by_type.items(), key=lambda x: -x[1]):
@@ -256,6 +288,7 @@ def _save(conn: Any, inn: str, fields: dict[str, Any], error: str = "") -> None:
             site_summary = :site_summary,
             site_specialization = :site_specialization,
             site_facts = :site_facts,
+            site_hiring = :site_hiring,
             site_error = :site_error,
             site_checked_at = :ts
         WHERE inn = :inn
@@ -268,6 +301,7 @@ def _save(conn: Any, inn: str, fields: dict[str, Any], error: str = "") -> None:
             "site_summary": fields.get("site_summary"),
             "site_specialization": fields.get("site_specialization"),
             "site_facts": fields.get("site_facts"),
+            "site_hiring": fields.get("site_hiring"),
             "site_error": error,
             "ts": db.now(),
         },

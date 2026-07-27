@@ -22,7 +22,8 @@ import re
 
 # Роль, а не человек: такие адреса безличны и хранить их можно.
 ROLE_LOCALS = {
-    "info", "mail", "office", "sales", "sale", "zakaz", "order", "orders",
+    "info", "information", "mail", "email", "office", "sales", "sale",
+    "zakaz", "zakazy", "order", "orders", "priem", "obratnaya",
     "contact", "contacts", "hello", "hi", "support", "help", "helpdesk",
     "admin", "reception", "secretary", "post", "inbox", "mailbox", "box",
     "company", "corp", "main", "general", "client", "clients", "service",
