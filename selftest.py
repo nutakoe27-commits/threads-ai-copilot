@@ -572,8 +572,12 @@ def main() -> int:
           "Кто это и чего хочет" in letter_frame)
     check("бриф требует связать наблюдение с предложением",
           "Мне это зачем" in letter_frame)
-    check("бриф задаёт длину делового письма",
-          "12–18 строк" in letter_frame)
+    check("бриф задаёт ориентир по длине",
+          "150–250 слов" in letter_frame)
+    check("главное правило длины — не число, а отсутствие повторов",
+          "каждый абзац несёт то, чего не было в предыдущих" in letter_frame)
+    check("бриф запрещает пересказывать происхождение письма",
+          "Не пересказывай эту мысль" in letter_frame)
     check("бриф запрещает и пересказ, и похвалу",
           "**Пересказ.**" in letter_frame and "**Похвала.**" in letter_frame)
     check("бриф требует вывода, а не перечисления",
@@ -850,7 +854,7 @@ def main() -> int:
     _, notes = compose.finish_letter(good.replace("Здравствуйте.\n\n", ""), origin)
     check("отсутствие приветствия замечено",
           any("приветствия" in note for note in notes), str(notes))
-    _, notes = compose.finish_letter("Здравствуйте.\n\n" + ("слово " * 320) + "?", origin)
+    _, notes = compose.finish_letter("Здравствуйте.\n\n" + ("слово " * 400) + "?", origin)
     check("слишком длинное письмо замечено",
           any("длинное" in note for note in notes), str(notes))
 
