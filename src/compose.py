@@ -93,6 +93,9 @@ def build_system_prompt(site_type: str) -> str:
 SIGN_OFFS = {"михаил", "с уважением", "всего доброго", "спасибо",
              "заранее спасибо", "хорошего дня", "до связи"}
 
+# Тема длиннее этого обрезается в списке писем на телефоне.
+SUBJECT_MAX = 50
+
 
 def load_origin() -> str:
     """Концовка письма: откуда оно и подпись. Дословно из конфига.
@@ -140,16 +143,22 @@ def finish_letter(body: str, origin: str) -> tuple[str, list[str]]:
     if not text.lower().startswith("здравствуйте"):
         notes.append("письмо не начинается с приветствия")
 
+    # Границы взяты из сводных данных по холодным письмам за 2026 год,
+    # а не из общих соображений: письма короче 125 слов дают примерно вдвое
+    # больше ответов, чем письма за 200 (DECISIONS.md, Р-036).
     words = len(text.split())
-    if words < 90:
+    if words < 70:
         notes.append(f"письмо короткое ({words} слов) — вероятно, "
                      f"не хватило места объяснить, кто пишет и зачем")
-    # Верхняя граница намеренно широкая. Замеров отклика у нас нет,
-    # и объявлять длину дефектом не на чем: в трёх письмах прогона
-    # 2026-07-27 мешала не длина, а повторы (DECISIONS.md, Р-035).
-    if words > 350:
-        notes.append(f"письмо длинное ({words} слов) — проверьте, "
-                     f"не повторяет ли какой-то абзац предыдущий")
+    if words > 180:
+        notes.append(f"письмо длинное ({words} слов при потолке 180) — "
+                     f"первое лицо такое сканирует, а не читает")
+
+    # Абзац длиннее четырёх строк на телефоне выглядит стеной, а с телефона
+    # эти письма и открывают чаще всего.
+    longest = max((len(p.split()) for p in text.split("\n\n")), default=0)
+    if longest > 60:
+        notes.append(f"самый длинный абзац — {longest} слов, разбейте его")
 
     return f"{text}\n\n{origin}", notes
 
@@ -294,7 +303,12 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
             logger.warning("— %s: письмо не написалось (%s)", name, exc)
             continue
 
-        body, notes = finish_letter(result.get("body", ""), origin)
+        subject = result.get("subject", "")
+        body, notes = finish_letter(body_text := result.get("body", ""), origin)
+        if len(subject) > SUBJECT_MAX:
+            notes.append(f"тема длинная ({len(subject)} знаков) — "
+                         f"на телефоне обрежется, укоротите до {SUBJECT_MAX}")
+        del body_text
         for note in notes:
             logger.warning("  ↳ %s: %s", name, note)
 
@@ -335,7 +349,7 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
                     letter_facts = ?, letter_status = ?, letter_written_at = ?
                 WHERE inn = ?
                 """,
-                (result.get("subject", ""), body, result.get("why_line", ""),
+                (subject, body, result.get("why_line", ""),
                  json.dumps(facts_used, ensure_ascii=False), status,
                  db.now(), row["inn"]),
             )
