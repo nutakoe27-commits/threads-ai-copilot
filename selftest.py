@@ -24,10 +24,13 @@ from pathlib import Path
 
 import yaml
 
+from typing import Any
+
 from src import (collect, compose, contacts, db, dossier, facts, guard,
                  hiring, llm, log, metrics, notify, outreach, report,
-                 targets)
+                 scoring, targets, techstack, ui)
 from src.providers import perplexity
+from src.sources import registries
 from src.providers.perplexity import PerplexityClient, PerplexityUnavailable
 from src.sources import website as website_module, zakupki
 from src.providers.checko import CheckoClient, RequestBudget, deep_pick, to_number
@@ -412,16 +415,16 @@ def main() -> int:
           CheckoClient.parse_finances({})["revenue"] is None)
 
     print("\n[12] Сила сигнала по динамике выручки")
-    scoring = yaml.safe_load(
+    signal_cfg = yaml.safe_load(
         Path("config/icp.yaml").read_text(encoding="utf-8"))["signal_scoring"]
     check("падение на 20% → сильный сигнал",
-          targets.describe_signal(-20.0, scoring)[0] == "strong")
+          targets.describe_signal(-20.0, signal_cfg)[0] == "strong")
     check("стагнация 1% → сильный сигнал",
-          targets.describe_signal(1.0, scoring)[0] == "strong")
+          targets.describe_signal(1.0, signal_cfg)[0] == "strong")
     check("рост 40% → обычный сигнал",
-          targets.describe_signal(40.0, scoring)[0] == "normal")
+          targets.describe_signal(40.0, signal_cfg)[0] == "normal")
     check("формулировка про падение понятна",
-          "упала" in targets.describe_signal(-20.0, scoring)[1])
+          "упала" in targets.describe_signal(-20.0, signal_cfg)[1])
 
     print("\n[13] Вердикт по ICP: ступень 1 (профиль)")
     icp = yaml.safe_load(Path("config/icp.yaml").read_text(encoding="utf-8"))
@@ -475,8 +478,8 @@ def main() -> int:
 
     print("\n[14b] Формулировка динамики")
     check("динамика около нуля не даёт «-0%»",
-          "0%" not in targets.describe_signal(-0.1, scoring)[1],
-          targets.describe_signal(-0.1, scoring)[1])
+          "0%" not in targets.describe_signal(-0.1, signal_cfg)[1],
+          targets.describe_signal(-0.1, signal_cfg)[1])
 
     print("\n[15] Бюджет запросов")
     budget = RequestBudget(limit=3)
@@ -995,6 +998,292 @@ def main() -> int:
     check("в досье дожима есть запрет повторяться",
           "Не повторяй ни мысль" in dossier_text)
 
+    print("\n[35] Технографика: что стоит у компании на сайте")
+    sample_html = """<html><head>
+      <meta name="generator" content="Joomla! 4.2">
+      <script src="https://mc.yandex.ru/metrika/tag.js"></script>
+      <script src="//cloud.roistat.com/dist/module.js"></script>
+      <script src="//code.jivosite.com/widget/abc"></script>
+      <link rel="stylesheet" href="/bitrix/templates/main/style.css">
+    </head><body>Мы делаем сайты</body></html>"""
+    stack = techstack.detect(sample_html)
+    check("счётчик найден", "Яндекс.Метрика" in stack.get("analytics", []), str(stack))
+    check("коллтрекинг отнесён к платному трафику",
+          "Roistat" in stack.get("paid", []), str(stack))
+    check("виджет захвата найден", "Jivo" in stack.get("capture", []), str(stack))
+    check("CMS определена по пути", "1С-Битрикс" in stack.get("cms", []), str(stack))
+    check("мета-тег generator добавляет CMS, которой нет в сигнатурах",
+          any("Joomla" in name for name in stack.get("cms", [])), str(stack))
+
+    short, explain = techstack.maturity(stack)
+    check("платный трафик читается как главный признак",
+          short == "платит за трафик и меряет его", short)
+    check("к признаку есть объяснение для человека", "стоимость заявки" in explain)
+
+    only_counter = techstack.detect('<script src="https://mc.yandex.ru/metrika/x"></script>')
+    check("один счётчик — это ещё не покупка трафика",
+          techstack.maturity(only_counter)[0] == "считает трафик, но не покупает",
+          str(techstack.maturity(only_counter)))
+    check("пустой сайт не выдумывает инструментов", techstack.detect("") == {})
+    check("без следов маркетинга так и сказано",
+          techstack.maturity({})[0] == "никаких следов маркетинга")
+    check("факты для досье перечисляют найденное",
+          any("Roistat" in fact for fact in techstack.as_facts(stack)),
+          str(techstack.as_facts(stack)))
+    check("строка для списка называет инструменты",
+          "Roistat" in techstack.describe(stack), techstack.describe(stack))
+
+    print("\n[36] Реестры Минцифры: разбор выгрузок и отметка компаний")
+    csv_text = ("Наименование;ИНН;Дата включения\n"
+                'ООО "АЛЬФА";7701234567;2026-03-01\n'
+                'ООО "БЕТА";5018046069;2026-04-15\n')
+    check("ИНН взяты из колонки по названию",
+          registries.parse_csv(csv_text) == {"7701234567", "5018046069"},
+          str(registries.parse_csv(csv_text)))
+
+    csv_no_header = "название;код\nАЛЬФА;7701234567\n"
+    check("без колонки ИНН разбирается весь текст",
+          "7701234567" in registries.parse_csv(csv_no_header),
+          str(registries.parse_csv(csv_no_header)))
+    check("двенадцатизначный ИНН предпринимателя тоже находится",
+          "500100732259" in registries._extract_inns_from_text("ИП, ИНН 500100732259"))
+    check("телефон за ИНН не принимается",
+          registries._extract_inns_from_text("+7 495 123-45-67") == set(),
+          str(registries._extract_inns_from_text("+7 495 123-45-67")))
+    check("ИНН из JSON любой вложенности",
+          registries.parse_json('{"items":[{"org":{"inn":"7701234567"}}]}')
+          == {"7701234567"})
+    check("битый JSON не роняет этап", registries.parse_json("{не json") == set())
+    check("оба реестра названы человеческими словами",
+          "реестре отечественного ПО" in registries.KINDS["software"]
+          and "аккредитован" in registries.KINDS["accredited"],
+          str(registries.KINDS))
+    check("человеку сказано, куда класть файлы",
+          "data/registries/software.csv" in registries.instructions())
+    check("XLSX честно назван неподдерживаемым",
+          "XLSX" in registries.instructions())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db.DB_PATH = Path(tmp) / "r.db"
+        registries.DATA_DIR = Path(tmp) / "registries"
+        registries.DATA_DIR.mkdir()
+        (registries.DATA_DIR / "software.csv").write_text(csv_text, encoding="utf-8")
+
+        conn = db.connect()
+        # 7701234567 есть в реестре и у нас; 9999999999 — только у нас.
+        for inn in ("7701234567", "9999999999"):
+            conn.execute("INSERT INTO companies (inn,name,first_seen,last_seen) "
+                         "VALUES (?,?,'t','t')", (inn, f"ООО {inn}"))
+        conn.commit()
+        conn.close()
+
+        check("файл реестра найден по имени",
+              "software" in registries.available_files(),
+              str(registries.available_files()))
+        result = registries.run()
+        check("реестр прочитан целиком", result["imported"] == 2, str(result))
+        check("отмечены только наши компании", result["matched"] == 1, str(result))
+
+        conn = db.connect()
+        flags = conn.execute("SELECT registry_flags FROM companies "
+                             "WHERE inn='7701234567'").fetchone()[0]
+        other = conn.execute("SELECT registry_flags FROM companies "
+                             "WHERE inn='9999999999'").fetchone()[0]
+        conn.close()
+        check("отметка сохранена", json.loads(flags) == ["software"], str(flags))
+        check("чужим отметка не проставлена", other is None, str(other))
+        check("отметка превращается в строку для списка",
+              "реестре отечественного ПО" in registries.describe(flags),
+              registries.describe(flags))
+
+        registries.DATA_DIR = Path(tmp) / "пусто"
+        check("без файлов этап не падает, а объясняет",
+              registries.run() == {"imported": 0, "matched": 0})
+
+    print("\n[37] Балл схождения сигналов")
+    with tempfile.TemporaryDirectory() as tmp:
+        db.DB_PATH = Path(tmp) / "s.db"
+        conn = db.connect()
+
+        def add(inn: str, **fields: Any) -> None:
+            columns = ["inn", "name", "first_seen", "last_seen", "icp_status"]
+            values: list[Any] = [inn, f"ООО {inn}", "t", "t", "passed"]
+            for key, value in fields.items():
+                columns.append(key)
+                values.append(value)
+            conn.execute(
+                f"INSERT INTO companies ({','.join(columns)}) "
+                f"VALUES ({','.join('?' for _ in columns)})", values)
+
+        # Один сильный признак против трёх слабых — ради этого сравнения
+        # балл и заводился.
+        add("100", site_hiring=json.dumps([{"strength": "strong"}]),
+            site_type="outsourcing", contact_email="info@a.ru")
+        add("200", tech_stack=json.dumps({"paid": ["Roistat"], "capture": ["Jivo"],
+                                          "analytics": ["Яндекс.Метрика"]}),
+            site_type="product", revenue_change_pct=-30.0, contact_email="info@b.ru")
+        add("300", tech_stack=json.dumps({"cms": ["WordPress"]}),
+            site_type="outsourcing", contact_email="tender@c.ru")
+        conn.commit()
+
+        rows = {r["inn"]: r for r in conn.execute("SELECT * FROM companies")}
+
+        strong_score, strong_why = scoring.score(rows["100"])
+        many_score, many_why = scoring.score(rows["200"])
+        poor_score, poor_why = scoring.score(rows["300"])
+
+        check("вакансия на холодные звонки распознана как сильная",
+              "hiring_strong" in scoring.signals_of(rows["100"]),
+              str(scoring.signals_of(rows["100"])))
+        check("схождение нескольких признаков перевешивает один сильный",
+              many_score > strong_score, f"{many_score} vs {strong_score}")
+        check("объяснение написано словами, а не ключами",
+              "платит за трафик" in " ".join(many_why), str(many_why))
+        check("объяснение отсортировано по весу",
+              many_why[0] == scoring.LABELS["pays_for_traffic"], str(many_why))
+        check("отсутствие следов маркетинга штрафуется",
+              "no_marketing_traces" in scoring.signals_of(rows["300"]),
+              str(scoring.signals_of(rows["300"])))
+        check("адрес не того отдела штрафуется",
+              "wrong_desk_email" in scoring.signals_of(rows["300"]),
+              str(scoring.signals_of(rows["300"])))
+        check("сумма штрафов уводит балл в минус", poor_score < 0, str(poor_score))
+
+        # Веса — настройка, а не константа: правка конфига меняет порядок.
+        flipped = scoring.score(rows["100"], {"hiring_strong": 100.0})[0]
+        check("вес из конфига пересиливает значение по умолчанию",
+              flipped > many_score, f"{flipped} vs {many_score}")
+        conn.close()
+
+        counters = scoring.recompute({"scoring": {"weights": {}}})
+        check("пересчёт прошёл по всем прошедшим ICP",
+              counters["scored"] == 3, str(counters))
+        conn = db.connect()
+        saved = conn.execute("SELECT signal_score, signal_reasons FROM companies "
+                             "WHERE inn='200'").fetchone()
+        conn.close()
+        check("балл сохранён в базе", saved["signal_score"] == many_score,
+              str(saved["signal_score"]))
+        check("объяснение сохранено рядом с баллом",
+              len(json.loads(saved["signal_reasons"])) == len(many_why))
+
+    print("\n[38] Логи: этап, база, замер времени")
+    with tempfile.TemporaryDirectory() as tmp:
+        db.DB_PATH = Path(tmp) / "l.db"
+        db.connect().close()
+
+        log.set_stage("dossier")
+        check("текущий этап запоминается", log.current_stage() == "dossier")
+
+        handler = log._DatabaseHandler()
+        logger = log.get("selftest")
+        logger.addHandler(handler)
+        try:
+            logger.info("проверочная запись")
+            logger.warning("проверочное предупреждение")
+            log.set_stage("compose")
+            logger.error("проверочная ошибка")
+        finally:
+            logger.removeHandler(handler)
+
+        rows = log.recent(limit=50)
+        check("записи попали в базу", len(rows) >= 3, str(len(rows)))
+        check("этап проставлен в записи",
+              {r["stage"] for r in rows} >= {"dossier", "compose"},
+              str({r["stage"] for r in rows}))
+        check("модуль записан без общего префикса",
+              all(not r["source"].startswith("leadgen.") for r in rows),
+              str({r["source"] for r in rows}))
+
+        warnings_only = log.recent(limit=50, level="WARNING")
+        check("фильтр по уровню отдаёт и то, что выше",
+              {r["level"] for r in warnings_only} == {"WARNING", "ERROR"},
+              str({r["level"] for r in warnings_only}))
+        check("фильтр по этапу сужает выдачу",
+              all(r["stage"] == "compose"
+                  for r in log.recent(limit=50, stage="compose")))
+
+        # Логирование не имеет права ронять прогон.
+        db.DB_PATH = Path(tmp) / "нет" / "такой" / "папки.db"
+        logger.addHandler(handler)
+        try:
+            logger.info("база недоступна, но прогон продолжается")
+            check("недоступная база не роняет логирование", True)
+        except Exception as exc:  # noqa: BLE001
+            check("недоступная база не роняет логирование", False, str(exc))
+        finally:
+            logger.removeHandler(handler)
+
+        db.DB_PATH = Path(tmp) / "l.db"
+        check("цвет выключается, когда вывод не в терминал",
+              log._color_supported() is False or sys.stdout.isatty())
+
+        with log.step("проверочный участок", logger):
+            pass
+        check("замер времени пишет в лог и не мешает работе",
+              any("проверочный участок" in r["message"] for r in log.recent(limit=50)),
+              str([r["message"] for r in log.recent(limit=5)]))
+
+        old = db.now()
+        conn = db.connect()
+        conn.execute("UPDATE log_entries SET ts = datetime('now','-90 days')")
+        conn.commit()
+        conn.close()
+        check("старые записи вычищаются", log.prune(days=30) > 0)
+        check("после чистки таблица пуста", log.recent(limit=5) == [], old)
+        log.set_stage("—")
+
+    print("\n[39] Панель: страницы собираются без сервера")
+    with tempfile.TemporaryDirectory() as tmp:
+        db.DB_PATH = Path(tmp) / "ui.db"
+        conn = db.connect()
+        conn.execute(
+            "INSERT INTO companies (inn,name,first_seen,last_seen,icp_status,"
+            "site_type,site_url,contact_email,staff,revenue,signal_score,"
+            "signal_reasons) VALUES ('7701','ООО ТОПС','t','t','passed',"
+            "'product','https://tops.ru','info@tops.ru',40,90000000,16.0,?)",
+            (json.dumps(["ищут людей на холодный поиск клиентов",
+                         "платит за трафик и меряет его"], ensure_ascii=False),))
+        outreach.save_touch(conn, "7701", 1, "про ваш продукт",
+                            "Здравствуйте.\n\nВы ищете людей в продажи.",
+                            "нанимают в продажи", "[]")
+        conn.commit()
+        conn.close()
+
+        letters = ui.letters_page().decode("utf-8")
+        check("письмо показано на главной", "про ваш продукт" in letters)
+        check("есть кнопка копирования", "копировать письмо" in letters)
+        check("есть кнопки статусов",
+              "отправлено" in letters and "просили не писать" in letters)
+        check("балл виден рядом с компанией", "16.0" in letters, letters[:400])
+        check("причины показаны словами",
+              "платит за трафик" in letters)
+        check("почта компании видна", "info@tops.ru" in letters)
+
+        # Имя компании с кавычками и угловыми скобками не должно ломать вёрстку.
+        conn = db.connect()
+        conn.execute("UPDATE companies SET name = ? WHERE inn='7701'",
+                     ('<b>ООО "Тест"</b>',))
+        conn.commit()
+        conn.close()
+        check("HTML в данных экранируется",
+              "&lt;b&gt;" in ui.letters_page().decode("utf-8"))
+
+        stats_html = ui.stats_page().decode("utf-8")
+        check("воронка собирается", "Воронка" in stats_html, stats_html[:300])
+        logs_html = ui.logs_page(level="INFO").decode("utf-8")
+        check("страница логов собирается", "уровень" in logs_html)
+        check("на странице логов есть фильтры",
+              "WARNING" in logs_html and "все этапы" in logs_html)
+        check("страница логов обновляется сама", "http-equiv=\"refresh\"" in logs_html)
+
+        # Пустая база — обычное состояние в первый день, не ошибка.
+        db.DB_PATH = Path(tmp) / "empty.db"
+        db.connect().close()
+        empty = ui.letters_page().decode("utf-8")
+        check("на пустой базе панель объясняет, что делать",
+              "--stage compose" in empty, empty[-400:])
+
     print("\n[20] Сквозной прогон: досье → письмо → утренний список")
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
@@ -1116,6 +1405,10 @@ def main() -> int:
             result = compose.run(icp_full)
         finally:
             llm.classify = original
+
+        # Так же, как в run.py: после письма пересчитываем баллы, иначе
+        # утренний список нечем сортировать.
+        scoring.recompute(icp_full)
 
         check("письма ушли в сильную модель, а не в дешёвую",
               captured.get("models") == {llm.MODEL_WRITE}, str(captured.get("models")))

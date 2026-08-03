@@ -237,6 +237,18 @@ def build_dossier(row: Any) -> str:
     if row["okved_name"]:
         background.append(f"вид деятельности по реестру: {row['okved_name']}")
 
+    # Технографика идёт сюда же, к «не упоминать». Она нужна, чтобы понять,
+    # на каком языке говорить с компанией, но фраза «я посмотрел, какие
+    # у вас стоят счётчики» звучит как слежка (DECISIONS.md, Р-044).
+    try:
+        stack = json.loads(row["tech_stack"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        stack = {}
+    if stack:
+        from . import techstack
+        _, explanation = techstack.maturity(stack)
+        background.append(f"маркетинг: {explanation}")
+
     if background:
         lines.append("")
         lines.append("ДЛЯ ПОНИМАНИЯ МАСШТАБА — в тексте письма не упоминать "

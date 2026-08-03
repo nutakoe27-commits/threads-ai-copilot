@@ -125,6 +125,20 @@ CREATE TABLE IF NOT EXISTS touches (
 
 CREATE INDEX IF NOT EXISTS idx_touches_inn ON touches(inn);
 CREATE INDEX IF NOT EXISTS idx_touches_status ON touches(status);
+
+-- Лог в базе. Файл logs/ остаётся полным, а эта таблица нужна интерфейсу:
+-- показать последние записи с фильтром по уровню и этапу, не читая файл.
+CREATE TABLE IF NOT EXISTS log_entries (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              TEXT NOT NULL,
+    level           TEXT NOT NULL,
+    stage           TEXT,
+    source          TEXT,
+    message         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_log_ts ON log_entries(ts);
+CREATE INDEX IF NOT EXISTS idx_log_level ON log_entries(level);
 """
 
 
@@ -190,6 +204,15 @@ MIGRATIONS = [
     ("companies", "outreach_at", "TEXT"),
     ("companies", "touch_count", "INTEGER"),
     ("companies", "last_touch_at", "TEXT"),
+    # Технографика: что стоит у компании на сайте. Считается из того же
+    # HTML, который и так скачан ради классификации (DECISIONS.md, Р-044).
+    ("companies", "tech_stack", "TEXT"),
+    ("companies", "tech_maturity", "TEXT"),
+    # Реестры Минцифры: аккредитация и отечественное ПО (Р-045).
+    ("companies", "registry_flags", "TEXT"),
+    # Суммарный балл схождения сигналов — по нему сортируется список (Р-046).
+    ("companies", "signal_score", "REAL"),
+    ("companies", "signal_reasons", "TEXT"),
 ]
 
 

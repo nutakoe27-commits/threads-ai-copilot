@@ -19,7 +19,8 @@ from pathlib import Path
 import yaml
 
 from src import (collect, compose, dossier, guard, log, metrics,
-                 outreach, report, targets)
+                 outreach, report, scoring, targets, ui)
+from src.sources import registries
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config" / "signals.yaml"
@@ -57,7 +58,7 @@ def main() -> int:
         "--stage",
         choices=["targets", "discover", "enrich", "rejudge", "dossier",
                  "compose", "followup", "morning", "telegram", "mark", "stats",
-                 "cleanup", "collect", "report", "all"],
+                 "registries", "score", "ui", "cleanup", "collect", "report", "all"],
         default="all",
         help=(
             "targets — построить целевой список через Checko (discover + enrich); "
@@ -70,6 +71,9 @@ def main() -> int:
             "telegram — отправить свежий утренний список в Telegram; "
             "mark — отметить статус: mark sent ИНН ИНН ...; "
             "stats — воронка за две недели и самодиагностика; "
+            "registries — импорт реестров Минцифры из data/registries/; "
+            "score — пересчитать баллы схождения сигналов (без запросов наружу); "
+            "ui — открыть локальную панель на 127.0.0.1:8765; "
             "cleanup — убрать из базы личные адреса, сохранённые до появления фильтра; "
             "collect/report — сбор сигналов и утренний список"
         ),
@@ -94,10 +98,23 @@ def main() -> int:
 
     load_env()
     logger = log.setup(verbose=args.verbose)
+    log.set_stage(args.stage)
     logger.info("=" * 70)
     logger.info("Запуск: этап=%s dry_run=%s", args.stage, args.dry_run)
 
     try:
+        if args.stage == "ui":
+            ui.serve(config=load_config(ICP_CONFIG_PATH))
+            return 0
+
+        if args.stage == "registries":
+            registries.run(dry_run=args.dry_run)
+            return 0
+
+        if args.stage == "score":
+            scoring.recompute(load_config(ICP_CONFIG_PATH), dry_run=args.dry_run)
+            return 0
+
         if args.stage == "stats":
             return 0 if metrics.run(args.days) == 0 else 0
 
@@ -133,12 +150,14 @@ def main() -> int:
             if not guard.enforce(icp_config):
                 return 2
             dossier.run(icp_config, dry_run=args.dry_run)
+            scoring.recompute(icp_config, dry_run=args.dry_run)
 
         if args.stage == "compose":
             icp_config = load_config(ICP_CONFIG_PATH)
             if not guard.enforce(icp_config):
                 return 2
             compose.run(icp_config, dry_run=args.dry_run)
+            scoring.recompute(icp_config, dry_run=args.dry_run)
 
         if args.stage == "followup":
             icp_config = load_config(ICP_CONFIG_PATH)

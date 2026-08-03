@@ -50,6 +50,10 @@ MAX_PAGES = 4
 MAX_BYTES = 500_000
 MAX_TEXT_CHARS = 12_000
 
+# Сколько сырого HTML держать для технографики. Сигнатуры инструментов
+# лежат в head и в конце body, поэтому много не нужно.
+MAX_RAW_CHARS = 200_000
+
 
 class _TextExtractor(HTMLParser):
     """Достаёт видимый текст, выкидывая скрипты, стили и разметку."""
@@ -107,6 +111,7 @@ class WebsiteFetcher:
             f"leadgen-research/0.1 (+{contact})" if contact
             else "leadgen-research/0.1"
         )
+        self._raw: list[str] = []
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": self.user_agent,
@@ -186,14 +191,16 @@ class WebsiteFetcher:
         исключение наружу: недоступный сайт — это нормальный исход, а не
         авария всего прогона.
         """
+        self._raw = []
         base_url = normalize_url(raw_url)
         if not base_url:
-            return {"ok": False, "reason": "некорректный адрес сайта", "text": "", "pages": []}
+            return {"ok": False, "reason": "некорректный адрес сайта", "text": "",
+                    "pages": [], "html": ""}
 
         reachable = self._reachable_base(base_url)
         if not reachable:
             return {"ok": False, "reason": "сайт не отвечает ни по одному варианту адреса",
-                    "text": "", "pages": []}
+                    "text": "", "pages": [], "html": ""}
         base_url = reachable
 
         robots, delay = self._robots(base_url)
@@ -214,18 +221,25 @@ class WebsiteFetcher:
             return {"ok": False,
                     "reason": "страницы открылись, но текста нет "
                               "(вероятно, сайт собирается скриптами в браузере)",
-                    "text": "", "pages": [], "hiring_text": "", "hiring_pages": []}
+                    "text": "", "pages": [], "hiring_text": "", "hiring_pages": [],
+                    "html": ""}
 
         combined = " ".join(collected)[:MAX_TEXT_CHARS]
         return {"ok": True, "reason": "", "text": combined, "pages": visited,
                 "hiring_text": " ".join(hiring)[:MAX_TEXT_CHARS],
                 "hiring_pages": hiring_pages,
+                "html": "\n".join(self._raw)[:MAX_RAW_CHARS],
                 "base_url": base_url}
 
     def _read_pages(self, base_url: str, paths: list[str],
                     robots: urllib.robotparser.RobotFileParser | None,
                     delay: float, budget: int) -> tuple[list[str], list[str]]:
-        """Читает страницы по списку путей, пока не кончится бюджет."""
+        """Читает страницы по списку путей, пока не кончится бюджет.
+
+        Побочно накапливает сырой HTML в self.raw_html. Он нужен для
+        технографики: инструменты видны по адресам скриптов и мета-тегам,
+        а из текста они уже вычищены (DECISIONS.md, Р-044).
+        """
         collected: list[str] = []
         visited: list[str] = []
 
@@ -254,6 +268,11 @@ class WebsiteFetcher:
                 continue
             finally:
                 time.sleep(delay)
+
+            # Сырой HTML нужен технографике. Копим ограниченно: сигнатуры
+            # инструментов лежат в head и в конце body, середина не нужна.
+            if len(self._raw) < MAX_RAW_CHARS:
+                self._raw.append(html[:MAX_RAW_CHARS])
 
             extractor = _TextExtractor()
             try:

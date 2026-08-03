@@ -211,15 +211,12 @@ def build_morning(config: dict[str, Any], dry_run: bool = False) -> Path | None:
           -- дожимы идут отдельным разделом (DECISIONS.md, Р-041).
           AND COALESCE(outreach_status, 'new') = 'new'
         ORDER BY
-            -- Кто прямо сейчас нанимает в продажи — первыми и всегда.
-            -- Это единственное настоящее событие в системе: всё остальное
-            -- (выручка, описание, ОКВЭД) — состояние, а не повод написать
-            -- сегодня. См. DECISIONS.md, Р-027.
-            CASE WHEN site_hiring IS NOT NULL AND site_hiring NOT IN ('', '[]')
-                 THEN 0 ELSE 1 END,
-            -- Продуктовые компании следом: у них ICP острее, и система
-            -- показывает себя на них лучше всего (DECISIONS.md, Р-020).
-            CASE WHEN site_type = 'product' THEN 0 ELSE 1 END,
+            -- По баллу схождения сигналов. Раньше сортировка шла по одному
+            -- признаку за раз: сначала нанимающие, потом продуктовые. Пока
+            -- признак был один, это работало. Теперь их шесть, и компания
+            -- с тремя слабыми интереснее компании с одним сильным
+            -- (DECISIONS.md, Р-046).
+            COALESCE(signal_score, 0) DESC,
             CASE WHEN revenue_change_pct IS NULL THEN 1 ELSE 0 END,
             revenue_change_pct
         LIMIT ?

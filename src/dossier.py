@@ -17,7 +17,7 @@ from typing import Any
 
 import yaml
 
-from . import db, facts as factlib, hiring, llm, log, metrics
+from . import db, facts as factlib, hiring, llm, log, metrics, techstack
 from .sources.website import WebsiteFetcher
 
 logger = log.get("dossier")
@@ -168,7 +168,7 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
 
     fetcher = WebsiteFetcher(site_cfg)
     counters = {"checked": 0, "no_site": 0, "unreachable": 0, "classified": 0,
-                "facts": 0, "facts_dropped": 0, "hiring": 0, "facts_ok": 0}
+                "facts": 0, "facts_dropped": 0, "hiring": 0, "facts_ok": 0, "tech": 0}
     by_type: dict[str, int] = {}
 
     for row in rows:
@@ -214,6 +214,13 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
         site_type = verdict.get("type", "unknown")
         by_type[site_type] = by_type.get(site_type, 0) + 1
 
+        # Технографика: тот же HTML, который уже скачан. Ноль новых запросов.
+        stack = techstack.detect(result.get("html", ""))
+        short, _ = techstack.maturity(stack)
+        if stack:
+            counters["tech"] += 1
+            logger.info("      ⚙ %s", techstack.describe(stack))
+
         site_facts, dropped = verify_facts(verdict.get("facts"), result["text"])
 
         # Вакансии на их же сайте. Сверять цитатой не нужно: мы нашли
@@ -250,6 +257,8 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
                     verdict.get("specialization", []), ensure_ascii=False),
                 "site_facts": json.dumps(site_facts, ensure_ascii=False),
                 "site_hiring": json.dumps(hiring_signals, ensure_ascii=False),
+                "tech_stack": json.dumps(stack, ensure_ascii=False),
+                "tech_maturity": short,
             })
 
     if not dry_run:
@@ -299,6 +308,8 @@ def _save(conn: Any, inn: str, fields: dict[str, Any], error: str = "") -> None:
             site_specialization = :site_specialization,
             site_facts = :site_facts,
             site_hiring = :site_hiring,
+            tech_stack = :tech_stack,
+            tech_maturity = :tech_maturity,
             site_error = :site_error,
             site_checked_at = :ts
         WHERE inn = :inn
@@ -312,6 +323,8 @@ def _save(conn: Any, inn: str, fields: dict[str, Any], error: str = "") -> None:
             "site_specialization": fields.get("site_specialization"),
             "site_facts": fields.get("site_facts"),
             "site_hiring": fields.get("site_hiring"),
+            "tech_stack": fields.get("tech_stack"),
+            "tech_maturity": fields.get("tech_maturity"),
             "site_error": error,
             "ts": db.now(),
         },
