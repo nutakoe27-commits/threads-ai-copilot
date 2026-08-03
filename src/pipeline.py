@@ -64,6 +64,15 @@ STAGES: list[dict[str, Any]] = [
         "costs": "запросы к модели",
     },
     {
+        "key": "rewrite",
+        "title": "Переписать письма заново",
+        "detail": "Стирает неотправленные письма и пишет их заново по текущим "
+                  "правилам. Отправленные не трогает. Запускать после правки "
+                  "текстов в «Настройках».",
+        "minutes": "2–6 минут",
+        "costs": "запросы к модели",
+    },
+    {
         "key": "followup",
         "title": "Написать дожимы",
         "detail": "Второе и третье письмо тем, кто не ответил. Каждое несёт "
@@ -183,6 +192,19 @@ def run_stage(stage: str, dry_run: bool = False, days: int = 14,
         config = _icp()
         result = compose.run(config, dry_run=dry_run) or {}
         scoring.recompute(config, dry_run=dry_run)
+        return result
+
+    if stage == "rewrite":
+        # Порядок важен: сначала стереть, потом писать. Иначе compose
+        # не увидит эти компании — у них уже есть письма.
+        config = _icp()
+        result = compose.reset_drafts(dry_run=dry_run)
+        if dry_run:
+            # В пробе стирать нечего, значит и писать нечего: показываем
+            # только, скольких это коснулось бы.
+            return result
+        result.update(compose.run(config) or {})
+        scoring.recompute(config)
         return result
 
     if stage == "followup":

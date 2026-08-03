@@ -274,6 +274,80 @@ def build_followup_dossier(row: Any, previous: list[Any]) -> str:
     return "\n".join(lines)
 
 
+def reset_drafts(dry_run: bool = False) -> dict[str, int]:
+    """Стирает неотправленные письма, чтобы написать их заново по новым правилам.
+
+    ЗАЧЕМ ОТДЕЛЬНЫЙ ЭТАП. Правка `letter.md` или `offer.md` не меняет письма,
+    которые уже лежат в базе готовым текстом. `compose` их тоже не тронет —
+    он берёт только тех, у кого письма ещё нет. Без этого этапа новые правила
+    доходят только до компаний, найденных завтра.
+
+    ЧТО НЕ ТРОГАЕТСЯ — отправленные письма. Их текст ушёл живому человеку
+    и остаётся записью того, что он получил. Переписывать его — значит
+    потерять то, на что он отвечает, и сломать дожимы, которые обязаны
+    не повторять первое письмо.
+
+    Черновики удаляются все, включая дожимы: черновик по определению
+    не отправлен (отметка «отправлено» переводит его в статус sent).
+    Иначе после повторного прогона в панели оказалось бы по два письма
+    на компанию.
+
+    Досье, вердикты по ICP и сами компании не трогаются вовсе, поэтому
+    повторный прогон не стоит ни одного запроса к Checko — только к модели.
+    """
+    conn = db.connect()
+
+    # Компании, письмо которым ещё не уходило. Статус 'new' и пустой статус —
+    # одно и то же: разные ветки кода ставили то одно, то другое.
+    rows = conn.execute(
+        """
+        SELECT inn, name FROM companies
+        WHERE letter_written_at IS NOT NULL
+          AND (outreach_status IS NULL OR outreach_status = 'new')
+        """
+    ).fetchall()
+
+    kept = conn.execute(
+        "SELECT COUNT(*) FROM companies WHERE letter_written_at IS NOT NULL "
+        "AND outreach_status IS NOT NULL AND outreach_status != 'new'"
+    ).fetchone()[0]
+
+    counters = {"reset": len(rows), "kept": int(kept), "drafts_removed": 0}
+
+    if not rows and not kept:
+        logger.info("Писем в базе нет — стирать нечего")
+        conn.close()
+        return counters
+
+    drafts = conn.execute(
+        "SELECT COUNT(*) FROM touches WHERE status = 'draft'").fetchone()[0]
+    counters["drafts_removed"] = int(drafts)
+
+    if not dry_run:
+        conn.execute("DELETE FROM touches WHERE status = 'draft'")
+        conn.execute(
+            """
+            UPDATE companies SET
+                letter_subject = NULL, letter_body = NULL, letter_why = NULL,
+                letter_facts = NULL, letter_status = NULL,
+                letter_written_at = NULL, last_reported = NULL
+            WHERE letter_written_at IS NOT NULL
+              AND (outreach_status IS NULL OR outreach_status = 'new')
+            """
+        )
+        conn.commit()
+    conn.close()
+
+    logger.info("Стёрто писем: %d, черновиков убрано: %d", len(rows), drafts)
+    if kept:
+        logger.info("Не тронуто отправленных писем: %d — их текст уже "
+                    "у адресата", kept)
+    if rows:
+        logger.info("Дальше — этап «Написать письма»: он напишет их заново "
+                    "по текущим правилам")
+    return counters
+
+
 def site_facts(row: Any) -> list[str]:
     """Проверенные факты с сайта компании. На них строится наблюдение."""
     try:

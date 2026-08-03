@@ -1369,9 +1369,10 @@ def main() -> int:
           all(item["title"] and item["detail"] for item in pipeline.STAGES),
           str([item["key"] for item in pipeline.STAGES if not item["detail"]]))
     check("порядок этапов — это порядок работы",
-          [item["key"] for item in pipeline.STAGES][:5]
-          == ["targets", "dossier", "compose", "followup", "morning"],
-          str([item["key"] for item in pipeline.STAGES][:5]))
+          [item["key"] for item in pipeline.STAGES][:3]
+          == ["targets", "dossier", "compose"]
+          and pipeline.STAGE_KEYS.index("followup") < pipeline.STAGE_KEYS.index("morning"),
+          str(pipeline.STAGE_KEYS))
     check("этапы, тратящие деньги, помечены",
           pipeline.describe("targets")["costs"] and
           not pipeline.describe("score")["costs"])
@@ -1519,6 +1520,78 @@ def main() -> int:
               len(settings.backups("проба")) <= settings.KEEP_BACKUPS,
               str(len(settings.backups("проба"))))
         del settings.FILES["проба"]
+
+    print("\n[43] Переписать письма заново после правки промпта")
+    with tempfile.TemporaryDirectory() as tmp:
+        db.DB_PATH = Path(tmp) / "rw.db"
+        conn = db.connect()
+        for inn, name, status in [("111", "ООО ЧЕРНОВИК", None),
+                                  ("222", "ООО ОТПРАВЛЕНО", "sent"),
+                                  ("333", "ООО НОВЫЙ", "new"),
+                                  ("444", "ООО ОТКАЗАЛИСЬ", "refused")]:
+            conn.execute(
+                "INSERT INTO companies (inn,name,first_seen,last_seen,"
+                "letter_subject,letter_body,letter_written_at,outreach_status,"
+                "last_reported) VALUES (?,?,'t','t','старая тема','старый текст',"
+                "'2026-08-01',?,'2026-08-01')", (inn, name, status))
+            outreach.save_touch(conn, inn, 1, "старая тема", "старый текст", "по", "[]")
+        conn.execute("UPDATE touches SET status='sent' WHERE inn IN ('222','444')")
+        conn.commit()
+        conn.close()
+
+        # Проба ничего не стирает — иначе кнопка «проба» была бы ловушкой.
+        preview = compose.reset_drafts(dry_run=True)
+        conn = db.connect()
+        check("проба не трогает письма",
+              conn.execute("SELECT COUNT(*) FROM companies "
+                           "WHERE letter_body IS NOT NULL").fetchone()[0] == 4)
+        conn.close()
+        check("проба показывает, скольких коснётся", preview["reset"] == 2, str(preview))
+
+        result = compose.reset_drafts()
+        check("стёрты только неотправленные", result["reset"] == 2, str(result))
+        check("отправленные посчитаны отдельно", result["kept"] == 2, str(result))
+
+        conn = db.connect()
+        rows = {r["inn"]: r for r in conn.execute("SELECT * FROM companies")}
+        # САМОЕ ВАЖНОЕ. Текст отправленного письма — запись того, что человек
+        # получил. Переписать его значит потерять то, на что он отвечает.
+        check("отправленное письмо не тронуто",
+              rows["222"]["letter_body"] == "старый текст", str(rows["222"]["letter_body"]))
+        check("письмо отказавшихся тоже не тронуто",
+              rows["444"]["letter_body"] == "старый текст")
+        check("неотправленное письмо стёрто", rows["111"]["letter_body"] is None)
+        check("статус «new» считается неотправленным", rows["333"]["letter_body"] is None)
+        check("отметка о показе снята, компания вернётся в список",
+              rows["111"]["last_reported"] is None)
+        check("у отправленной отметка о показе осталась",
+              rows["222"]["last_reported"] == "2026-08-01")
+
+        # Черновик по определению не отправлен. Если его не удалить, после
+        # повторного прогона в панели окажется по два письма на компанию.
+        check("черновики убраны",
+              conn.execute("SELECT COUNT(*) FROM touches "
+                           "WHERE status='draft'").fetchone()[0] == 0)
+        check("отправленные касания на месте",
+              conn.execute("SELECT COUNT(*) FROM touches "
+                           "WHERE status='sent'").fetchone()[0] == 2)
+        conn.close()
+
+        # После стирания compose снова видит эти компании как ждущие письма.
+        conn = db.connect()
+        waiting = conn.execute(
+            "SELECT COUNT(*) FROM companies WHERE letter_body IS NULL "
+            "AND letter_status IS NULL").fetchone()[0]
+        conn.close()
+        check("стёртые компании снова ждут письма", waiting == 2, str(waiting))
+
+        check("повторный запуск на пустом месте не падает",
+              compose.reset_drafts()["reset"] == 0)
+
+    check("переписывание есть отдельной кнопкой в панели",
+          "rewrite" in pipeline.STAGE_KEYS)
+    check("кнопка объясняет, что отправленные не трогает",
+          "Отправленные не трогает" in pipeline.describe("rewrite")["detail"])
 
     print("\n[20] Сквозной прогон: досье → письмо → утренний список")
     with tempfile.TemporaryDirectory() as tmp:

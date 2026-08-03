@@ -83,6 +83,7 @@ python3 run.py --stage ui # панель на http://127.0.0.1:8765
 python3 run.py --stage targets     # найти компании
 python3 run.py --stage dossier     # обойти сайты и собрать досье
 python3 run.py --stage compose     # написать письма
+python3 run.py --stage rewrite     # переписать заново после правки промпта
 python3 run.py --stage followup    # дожимы тем, кто не ответил
 python3 run.py --stage morning     # собрать утренний список
 python3 run.py --stage stats       # воронка и самодиагностика
