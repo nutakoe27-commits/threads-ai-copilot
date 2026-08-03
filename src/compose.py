@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -94,7 +95,65 @@ SIGN_OFFS = {"михаил", "с уважением", "всего доброго
              "заранее спасибо", "хорошего дня", "до связи"}
 
 # Тема длиннее этого обрезается в списке писем на телефоне.
-SUBJECT_MAX = 50
+#
+# Раньше стояло 50. Поднято до 70, потому что тема теперь называет действие
+# и компанию сразу: «Автоматизация поиска клиентов для отдела продаж PROMT» —
+# это 53 знака. Обрезание на телефоне при этом никуда не делось: первые
+# 35–40 знаков должны нести смысл сами по себе (DECISIONS.md, Р-048).
+SUBJECT_MAX = 70
+
+# ЖАРГОН И СОКРАЩЕНИЯ. Письмо читает генеральный директор, а не специалист
+# по продажам. Слово, которого он не понял, — это секунда задержки, а у
+# письма их всего две.
+#
+# Проверка живёт в коде, а не только в промпте, намеренно. Просить модель
+# «не использовать сокращения» бесполезно ровно так же, как было бесполезно
+# просить её не подписываться: она соглашается и через письмо забывает.
+#
+# Слова в нижнем регистре — по корню, чтобы ловились все падежи.
+JARGON_WORDS = {
+    "лидоген": "поиск клиентов",
+    "лидген": "поиск клиентов",
+    "конверси": "сколько из них ответили",
+    "воронк": "путь от письма до сделки",
+    "пайплайн": "список сделок в работе",
+    "аутрич": "исходящие письма",
+    "скоринг": "оценка компании по признакам",
+    "квалификац": "проверка, подходит ли компания",
+    "ретеншн": "удержание клиентов",
+    "чурн": "уход клиентов",
+    "фоллоу": "второе письмо",
+    "оффер": "предложение",
+}
+
+# Сокращения из заглавных букв ловятся правилом, а не списком: список всегда
+# отстаёт от изобретательности модели. Два и больше подряд — уже сокращение.
+_ACRONYM_RE = re.compile(r"\b[A-ZА-ЯЁ]{2,}\b")
+
+# Что разрешено, хотя и написано заглавными.
+ACRONYM_ALLOWED = {"P.S.", "PS", "SMS"}
+
+
+def find_jargon(text: str, company: str = "") -> list[str]:
+    """Сокращения и профессиональные слова в тексте письма.
+
+    `company` — название компании-адресата: его сокращения разрешены,
+    иначе письмо в PROMT ругалось бы на слово PROMT.
+    """
+    allowed = set(ACRONYM_ALLOWED)
+    for token in _ACRONYM_RE.findall((company or "").upper()):
+        allowed.add(token)
+
+    found: list[str] = []
+    for token in _ACRONYM_RE.findall(text):
+        if token not in allowed and token not in found:
+            found.append(token)
+
+    lowered = text.lower()
+    for root, replacement in JARGON_WORDS.items():
+        if root in lowered:
+            found.append(f"{root}… (лучше: {replacement})")
+    return found
 
 
 def load_origin() -> str:
@@ -111,14 +170,20 @@ def load_origin() -> str:
     return text.strip()
 
 
-def finish_letter(body: str, origin: str) -> tuple[str, list[str]]:
+def finish_letter(body: str, origin: str, company: str = "",
+                  short: bool = False) -> tuple[str, list[str]]:
     """Дописывает концовку и проверяет письмо механически.
 
     Всё, что здесь проверяется, — не про вкус, а про соблюдение прямых
     запретов. Просить модель об этом бесполезно: подпись она теряла три
     прогона подряд, а описание системы сочиняла каждый раз заново.
     Возвращает готовый текст и список замечаний для человека.
+
+    `short=True` — для дожима. У него своя длина и три абзаца вместо пяти:
+    знакомиться заново не нужно, нужна одна новая мысль.
     """
+    min_words, max_words = (55, 140) if short else (95, 220)
+    min_paragraphs = 3 if short else 4
     text = (body or "").strip()
     notes: list[str] = []
 
@@ -138,27 +203,48 @@ def finish_letter(body: str, origin: str) -> tuple[str, list[str]]:
         break
     text = "\n".join(lines).strip()
 
-    if "!" in text:
-        notes.append("в тексте есть восклицательный знак — уберите руками")
     if not text.lower().startswith("здравствуйте"):
         notes.append("письмо не начинается с приветствия")
 
-    # Границы взяты из сводных данных по холодным письмам за 2026 год,
-    # а не из общих соображений: письма короче 125 слов дают примерно вдвое
-    # больше ответов, чем письма за 200 (DECISIONS.md, Р-036).
+    # Восклицательный знак разрешён ровно один раз — в приветствии. Дальше
+    # по тексту он читается как напор, а напор в холодном письме не работает.
+    body_after_greeting = "\n\n".join(text.split("\n\n")[1:])
+    if "!" in body_after_greeting:
+        notes.append("восклицательный знак в тексте письма — он разрешён "
+                     "только в «Здравствуйте!»")
+
+    # СОКРАЩЕНИЯ. Главная проверка этого блока: письмо читает генеральный
+    # директор, а не специалист по продажам (DECISIONS.md, Р-048).
+    jargon = find_jargon(text, company)
+    if jargon:
+        notes.append("сокращения и жаргон — распишите словами: "
+                     + ", ".join(jargon[:6]))
+
+    # Длина. Письмо теперь объясняет, что делает система и по каким признакам
+    # ищет, — на это нужно место. Потолок держим: получатель сканирует.
     words = len(text.split())
-    if words < 70:
+    if words < min_words:
         notes.append(f"письмо короткое ({words} слов) — вероятно, "
-                     f"не хватило места объяснить, кто пишет и зачем")
-    if words > 180:
-        notes.append(f"письмо длинное ({words} слов при потолке 180) — "
+                     f"не хватило места на признаки покупателя")
+    if words > max_words:
+        notes.append(f"письмо длинное ({words} слов при потолке {max_words}) — "
                      f"первое лицо такое сканирует, а не читает")
 
     # Абзац длиннее четырёх строк на телефоне выглядит стеной, а с телефона
     # эти письма и открывают чаще всего.
     longest = max((len(p.split()) for p in text.split("\n\n")), default=0)
-    if longest > 60:
+    if longest > 70:
         notes.append(f"самый длинный абзац — {longest} слов, разбейте его")
+
+    # Пять частей письма: приветствие, вопрос, что делает Михаил,
+    # что предлагает, просьба. Меньше четырёх абзацев — какая-то выпала.
+    paragraphs = [p for p in text.split("\n\n") if p.strip()]
+    if len(paragraphs) < min_paragraphs:
+        notes.append(f"абзацев {len(paragraphs)} — проверьте, что на месте "
+                     f"вопрос, рассказ о системе, предложение и просьба")
+    if "?" not in text and not short:
+        notes.append("в письме нет ни одного вопроса — первый абзац должен "
+                     "спрашивать про их работу")
 
     return f"{text}\n\n{origin}", notes
 
@@ -304,8 +390,9 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
         return {"written": 0}
 
     counters = {"written": 0, "failed": 0, "thin": 0}
-    for row in rows:
+    for index, row in enumerate(rows, start=1):
         name = row["name"]
+        log.progress(index, len(rows), name)
 
         # Если фактов с сайта меньше минимума, письмо всё равно окажется
         # шаблонным — модель не может опереться на то, чего нет. Не тратим
@@ -341,7 +428,7 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
             continue
 
         subject = result.get("subject", "")
-        body, notes = finish_letter(body_text := result.get("body", ""), origin)
+        body, notes = finish_letter(body_text := result.get("body", ""), origin, name)
         if len(subject) > SUBJECT_MAX:
             notes.append(f"тема длинная ({len(subject)} знаков) — "
                          f"на телефоне обрежется, укоротите до {SUBJECT_MAX}")
@@ -451,8 +538,9 @@ def run_followups(config: dict[str, Any], dry_run: bool = False) -> dict[str, in
         return {"written": 0}
 
     counters = {"written": 0, "failed": 0}
-    for row in rows:
+    for index, row in enumerate(rows, start=1):
         name = row["name"]
+        log.progress(index, len(rows), name)
         step = int(row["touch_count"] or 1) + 1
         previous = outreach.previous_touches(conn, row["inn"])
 
@@ -476,7 +564,7 @@ def run_followups(config: dict[str, Any], dry_run: bool = False) -> dict[str, in
             logger.warning("— %s: дожим не написался (%s)", name, exc)
             continue
 
-        body, notes = finish_letter(result.get("body", ""), origin)
+        body, notes = finish_letter(result.get("body", ""), origin, name, short=True)
         for note in notes:
             logger.warning("  ↳ %s: %s", name, note)
 

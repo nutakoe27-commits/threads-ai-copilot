@@ -58,6 +58,31 @@ def current_stage() -> str:
     return _current_stage
 
 
+# Куда сообщать о ходе работы. По умолчанию — никуда: в терминале прогресс
+# и так виден построчно, а вот панели нужна доля выполненного.
+#
+# Приёмник сообщений о прогрессе имеет право бросить исключение — так
+# устроена остановка прогона из панели. Этапы его не ловят, оно выходит
+# наружу и прогон честно завершается прерванным (DECISIONS.md, Р-050).
+_progress_sink: Any = None
+
+
+def set_progress_sink(sink: Any) -> None:
+    """Назначает приёмник прогресса. None — отключить."""
+    global _progress_sink
+    _progress_sink = sink
+
+
+def progress(done: int, total: int, label: str = "") -> None:
+    """Сообщает, сколько сделано из скольких.
+
+    Вызывается внутри циклов этапов. Когда панель не запущена, не делает
+    ничего и стоит один вызов функции — этого не жалко.
+    """
+    if _progress_sink is not None:
+        _progress_sink(done, total, label)
+
+
 class _ProblemCollector(logging.Handler):
     """Складывает WARNING и ERROR в список, чтобы показать их в отчёте."""
 

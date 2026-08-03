@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import zipfile
 from datetime import date, timedelta
 from pathlib import Path
@@ -27,8 +28,8 @@ import yaml
 from typing import Any
 
 from src import (collect, compose, contacts, db, dossier, facts, guard,
-                 hiring, llm, log, metrics, notify, outreach, report,
-                 scoring, targets, techstack, ui)
+                 hiring, jobs, llm, log, metrics, notify, outreach, pipeline,
+                 report, scoring, settings, targets, techstack, ui)
 from src.providers import perplexity
 from src.sources import registries
 from src.providers.perplexity import PerplexityClient, PerplexityUnavailable
@@ -559,8 +560,8 @@ def main() -> int:
               and "Что Михаил делает" in prompt, str(len(prompt)))
     check("неизвестный тип падает на запасной угол",
           "С кем ты говоришь" in compose.build_system_prompt("нет_такого_типа"))
-    check("продуктовым говорим про их покупателя",
-          "круг покупателей уже" in compose.build_system_prompt("product"))
+    check("продуктовым говорим про перебор рынка",
+          "круг покупателей конечный" in compose.build_system_prompt("product"))
     check("аутсорсу говорим про специализацию",
           "специализацию" in compose.build_system_prompt("outsourcing"))
     check("интегратору говорим про конечное число покупателей",
@@ -575,48 +576,58 @@ def main() -> int:
     # можно переписывать свободно, проверки переживут.
     for anchor, what in [
         ("Михаил работает один", "сказано, что работает один"),
-        ("охотнее отвечает", "работа в одиночку подана как преимущество"),
         ("Придумывать их запрещено", "запрет выдумывать кейсы"),
-        ("Доказательство у Михаила одно", "доказательство — само письмо"),
         ("просматривает", "описано, что читатель просматривает, а не читает"),
-        ("Сначала вывод", "требование суть в начале"),
-        ("кто пишет и чего хочет", "требование объяснить, кто пишет"),
-        ("зачем мне это", "требование связать наблюдение с предложением"),
+        # Устройство письма из пяти частей — образец Михаила (Р-048).
+        ("Первый абзац письма — вопрос", "письмо начинается с вопроса"),
+        ("Вопрос должен быть измеримым", "вопрос про часы и недели, а не про чувства"),
+        ("Я делаю системы", "второй абзац начинается прямо"),
+        ("три-четыре конкретных", "признаки покупателя перечисляются"),
+        ("сравнение по времени", "во втором абзаце есть сравнение по времени"),
+        ("Что предлагаю:", "третий абзац — предложение"),
         ("Ровно одно", "ровно одно действие в конце"),
-        ("пересказать", "запрет на пересказ"),
-        ("похвалить", "запрет на похвалу"),
-        ("сделать вывод", "требование вывода, а не перечисления"),
-        ("начинай письмо с него", "вакансия берётся первой"),
-        ("90–150 слов", "длина задана числом"),
-        ("Больше 180 не бывает", "потолок длины задан"),
-        ("структура важнее объёма", "оговорка про структуру"),
-        ("не длиннее трёх строк", "ограничение абзаца"),
+        ("конкретные дни", "просьба называет дни"),
         ("Подпись не пиши", "подпись подставляет код"),
-        ("Своими словами эту мысль", "запрет пересказывать происхождение письма"),
+        # Главное правило этой версии: никаких сокращений (Р-048).
+        ("Любое сокращение из заглавных букв запрещено", "правило шире таблицы"),
+        ("ЛПР", "самое частое сокращение названо прямо"),
+        ("SDR", "второе частое сокращение названо прямо"),
+        ("110–180 слов", "длина задана числом"),
+        ("Больше 220 не бывает", "потолок длины задан"),
+        ("не длиннее четырёх строк", "ограничение абзаца"),
+        ("вопрос в первом абзаце строится вокруг него", "вакансия важнее прочего"),
         ("Связывай предложения по цепочке", "требование цепной связи"),
         ("два значения", "запрет двусмысленных слов"),
         ("Выручки и численности", "запрет на финансы компании"),
-        ("Не длиннее 50 знаков", "ограничение темы"),
-        ("Строчная буква в начале темы", "строчные только в теме"),
-        ("подойдёт ли это письмо другой", "финальная проверка"),
+        ("Не длиннее 70 знаков", "ограничение темы"),
+        ("это письмо другой компании", "финальная проверка"),
     ]:
         check(f"бриф: {what}", anchor in letter_frame, anchor)
 
     for anchor, what in [
         ("кладёт на стол короткий список", "объяснение, что Михаил делает"),
-        ("Просто ответить", "просьба — просто ответить"),
-        ("Обещаний что-то прислать", "запрет обещать ручную работу"),
-        ("Когда вам удобно созвониться", "запрет назначать встречу"),
-        ("не отслеживает новости", "перечислено, чего система НЕ делает"),
+        ("пилотный список", "предложение — пилотный список"),
+        ("пятнадцать минут", "просьба — короткий разговор"),
+        ("около тридцати минут", "цифра сравнения задана"),
+        ("Просьба ровно одна", "просьба одна"),
         ("успейте", "запрет давления"),
     ]:
         check(f"оффер: {what}", anchor in offer_text, anchor)
 
-    # Оффер не должен создавать ручную работу на каждый ответ: один раз
-    # там уже стоял «пришлю пять компаний» (DECISIONS.md, Р-034).
-    check("в оффере не осталось обещания списка компаний",
-          "пяти компаний" not in offer_text and "пять компаний" not in offer_text,
-          "вернулся оффер с ручной работой")
+    # СИСТЕМА НЕ ХРАНИТ ЛЮДЕЙ. В образце Михаила стояло «обогащаю контактами
+    # ЛПР» — этого система не делает и делать не будет (Р-000). Оффер обязан
+    # говорить об этом прямо, иначе письмо пообещает то, чего нет.
+    check("оффер честно говорит, что имён людей система не находит",
+          "не находит имена и личные адреса" in offer_text,
+          "вернулось обещание личных контактов")
+
+    # Обещание пилотного списка подъёмно только потому, что срабатывает
+    # на ответивших, а не на всех получателях (Р-049). Файл обязан это
+    # объяснять — иначе следующая правка вернёт обещание в каждое письмо.
+    check("в оффере записано, почему обещание подъёмно",
+          "на ответивших, а не на всех" in offer_text, offer_text[:400])
+    check("остальные обещания по-прежнему запрещены",
+          "Обещаний, кроме пилотного списка" in offer_text)
 
     print("\n[21] Сверка фактов без модели")
     site_text = (
@@ -806,32 +817,36 @@ def main() -> int:
     src_dossier = Path("src/dossier.py").read_text(encoding="utf-8")
     check("dossier явно указывает модель", "model=llm.MODEL_EXTRACT" in src_dossier)
 
-    print("\n[29] Концовка письма подставляется кодом, а не моделью")
+    print("\n[29] Концовка письма и механические проверки текста")
     origin = compose.load_origin()
     check("комментарии из файла выброшены", "<!--" not in origin and "-->" not in origin)
-    check("в концовке есть подпись", origin.strip().endswith("Михаил"), origin)
-    check("концовка короткая", len(origin.splitlines()) <= 5, origin)
+    check("в концовке есть подпись", "Михаил" in origin, origin)
+    check("в концовке есть контакты", "+7" in origin, origin)
+    check("в концовке есть приписка про работу в одиночку",
+          "напрямую с исполнителем" in origin, origin)
+    check("концовка короткая", len(origin.splitlines()) <= 7, origin)
 
-    # Письмо нормальной длины, каким оно должно быть после Р-033.
+    # Письмо ровно того устройства, которое задал Михаил своим образцом:
+    # приветствие, вопрос, что делаю, что предлагаю, просьба (Р-048).
     good = (
-        "Здравствуйте.\n\n"
-        "У вас в САРУС+ есть отдельный модуль под композиты, с моделированием "
-        "драпировки ткани на криволинейных поверхностях, и рядом с ним "
-        "технологическая подготовка производства с инструкциями для цеха.\n\n"
-        "Из этого видно, что покупатель у вас появляется не тогда, когда "
-        "конструкторам понадобился PDM, а когда одно изделие надо провести "
-        "от компоновки до станка, не потеряв связей по дороге. Таких "
-        "заказчиков можно перечислить по внешним признакам, не дожидаясь, "
-        "пока они сами придут.\n\n"
-        "Я собираю системы, которые каждое утро приносят список компаний, "
-        "которым стоит написать сегодня, с обоснованием по каждой. Это письмо "
-        "пришло оттуда же, поэтому проверить работу можно прямо сейчас.\n\n"
-        "Если тема близка, напишите пару слов в ответ — расскажу, как такой "
-        "список выглядел бы для ваших заказчиков."
+        "Здравствуйте!\n\n"
+        "Вопрос по вашему отделу продаж: сколько часов в неделю уходит на то, "
+        "чтобы найти и проверить компании, прежде чем дойти до первого "
+        "разговора?\n\n"
+        "Я делаю системы, которые закрывают этот этап автоматически: собираю "
+        "из открытых источников компании по вашим признакам (отрасль, наличие "
+        "своего конструкторского отдела, работа с композитами), нахожу рабочие "
+        "адреса и отдаю готовый список. Один прогон — около тридцати минут "
+        "вместо недели ручной работы менеджера.\n\n"
+        "Что предлагаю: соберу пилотный список компаний по вашему покупателю, "
+        "бесплатно. Если по нему пойдут ответы — обсудим постоянную систему "
+        "под ваш профиль.\n\n"
+        "Удобно пятнадцать минут в четверг или в пятницу, чтобы вы описали, "
+        "кто ваш покупатель? Скажите время — пришлю ссылку."
     )
-    finished, notes = compose.finish_letter(good, origin)
-    check("концовка приклеена", finished.endswith(origin), finished)
-    check("у нормального письма замечаний нет", notes == [], str(notes))
+    finished, notes = compose.finish_letter(good, origin, "САРУС")
+    check("концовка приклеена", finished.endswith(origin), finished[-200:])
+    check("у письма по образцу замечаний нет", notes == [], str(notes))
 
     # Подпись модель дописывает вопреки запрету — иначе она будет дважды.
     finished, _ = compose.finish_letter(good + "\n\nС уважением,\nМихаил", origin)
@@ -839,20 +854,85 @@ def main() -> int:
           finished.count("Михаил") == 1, finished[-260:])
     check("«с уважением» срезано", "уважением" not in finished, finished[-260:])
 
-    _, notes = compose.finish_letter(good.replace("пару слов", "пару слов!"), origin)
-    check("восклицательный знак замечен",
+    # ГЛАВНАЯ ПРОВЕРКА ЭТОГО РАЗДЕЛА (Р-048). Сокращения ловит код, а не
+    # промпт: просить модель их не писать — то же самое, что просить её
+    # не подписываться, и это уже не работало.
+    check("сокращение из заглавных букв поймано",
+          compose.find_jargon("Отдам список в вашу CRM") == ["CRM"],
+          str(compose.find_jargon("Отдам список в вашу CRM")))
+    check("русское сокращение поймано",
+          "ЛПР" in compose.find_jargon("Найду контакты ЛПР"))
+    check("название компании-адресата сокращением не считается",
+          compose.find_jargon("Ваш продукт PROMT известен", "PROMT") == [],
+          str(compose.find_jargon("Ваш продукт PROMT известен", "PROMT")))
+    check("жаргон в нижнем регистре поймано по корню",
+          any("конверси" in item for item in
+              compose.find_jargon("Посмотрим на конверсию писем")))
+    check("падеж жаргону не помогает",
+          any("воронк" in item for item in
+              compose.find_jargon("Наверху воронки становится шире")))
+    check("к жаргону предложена замена",
+          "путь от письма до сделки" in " ".join(
+              compose.find_jargon("Наверху воронки становится шире")))
+    check("обычный текст сокращений не содержит",
+          compose.find_jargon("Соберу список компаний по вашим признакам") == [])
+
+    _, notes = compose.finish_letter(good.replace("вашу CRM", "вашу CRM"), origin)
+    _, notes = compose.finish_letter(
+        good.replace("нахожу рабочие адреса", "нахожу контакты ЛПР"), origin)
+    check("сокращение в письме попадает в замечания",
+          any("сокращения" in note for note in notes), str(notes))
+
+    # Восклицательный знак разрешён только в приветствии.
+    _, notes = compose.finish_letter(good, origin, "САРУС")
+    check("«Здравствуйте!» замечанием не считается",
+          not any("восклицательный" in note for note in notes), str(notes))
+    _, notes = compose.finish_letter(
+        good.replace("пришлю ссылку.", "пришлю ссылку!"), origin, "САРУС")
+    check("восклицательный знак в тексте замечен",
           any("восклицательный" in note for note in notes), str(notes))
 
-    _, notes = compose.finish_letter("Здравствуйте.\n\nПишу вам.", origin)
+    _, notes = compose.finish_letter("Здравствуйте!\n\nПишу вам.", origin)
     check("слишком короткое письмо замечено",
           any("короткое" in note for note in notes), str(notes))
-    _, notes = compose.finish_letter(good.replace("Здравствуйте.\n\n", ""), origin)
+    check("нехватка абзацев замечена",
+          any("абзацев" in note for note in notes), str(notes))
+
+    _, notes = compose.finish_letter(good.replace("Здравствуйте!\n\n", ""), origin,
+                                     "САРУС")
     check("отсутствие приветствия замечено",
           any("приветствия" in note for note in notes), str(notes))
+
     _, notes = compose.finish_letter(
-        "Здравствуйте.\n\n" + "слово " * 60 + "\n\n" + "слово " * 130, origin)
+        "Здравствуйте!\n\n" + "слово " * 80 + "\n\n" + "слово " * 80
+        + "\n\n" + "слово " * 80 + "\n\nслово?", origin)
     check("слишком длинное письмо замечено",
           any("длинное" in note for note in notes), str(notes))
+
+    no_question = good.replace(
+        "Вопрос по вашему отделу продаж: сколько часов в неделю уходит на то, "
+        "чтобы найти и проверить компании, прежде чем дойти до первого "
+        "разговора?",
+        "У вас есть отдел продаж.")
+    _, notes = compose.finish_letter(
+        no_question.replace("кто ваш покупатель? Скажите", "кто ваш покупатель. Скажите"),
+        origin, "САРУС")
+    check("письмо без единого вопроса замечено",
+          any("вопроса" in note for note in notes), str(notes))
+
+    # У дожима свои границы: три абзаца и меньше слов. Общие проверки
+    # не должны на нём срабатывать зря.
+    short_letter = (
+        "Здравствуйте!\n\n"
+        "У вас дилерская сеть по стране и шесть филиалов в крупных городах. "
+        "Значит, у вашего покупателя обычно уже стоит чужая система, и "
+        "разговор с ним начинается не с нуля, а с замены. Таких покупателей "
+        "видно снаружи по отрасли и по тому, что у них есть свой отдел "
+        "сопровождения.\n\n"
+        "Если тема близка, ответьте парой слов — расскажу, как такой список "
+        "выглядел бы для ваших заказчиков.")
+    _, notes = compose.finish_letter(short_letter, origin, short=True)
+    check("у дожима своя длина, лишних замечаний нет", notes == [], str(notes))
 
     print("\n[30] Воронка: запись, конверсия, ловля деградации")
     with tempfile.TemporaryDirectory() as tmp:
@@ -1282,7 +1362,163 @@ def main() -> int:
         db.connect().close()
         empty = ui.letters_page().decode("utf-8")
         check("на пустой базе панель объясняет, что делать",
-              "--stage compose" in empty, empty[-400:])
+              "Написать письма" in empty and "Прогон" in empty, empty[-500:])
+
+    print("\n[40] Один список этапов на командную строку и панель")
+    check("этапы описаны человеческим языком",
+          all(item["title"] and item["detail"] for item in pipeline.STAGES),
+          str([item["key"] for item in pipeline.STAGES if not item["detail"]]))
+    check("порядок этапов — это порядок работы",
+          [item["key"] for item in pipeline.STAGES][:5]
+          == ["targets", "dossier", "compose", "followup", "morning"],
+          str([item["key"] for item in pipeline.STAGES][:5]))
+    check("этапы, тратящие деньги, помечены",
+          pipeline.describe("targets")["costs"] and
+          not pipeline.describe("score")["costs"])
+    check("ключи этапов не повторяются",
+          len(pipeline.STAGE_KEYS) == len(set(pipeline.STAGE_KEYS)))
+    check("неизвестный этап описывается, а не падает",
+          pipeline.describe("нет_такого")["title"] == "нет_такого")
+    check("неизвестный этап не запускается",
+          _raises(pipeline.StageError, lambda: pipeline.run_stage("нет_такого")))
+    check("mark без ИНН объясняет, чего не хватает",
+          _raises(pipeline.StageError, lambda: pipeline.run_stage("mark", rest=["sent"])))
+
+    # Командная строка и панель обязаны знать один и тот же набор этапов:
+    # ради этого модуль и заводился.
+    src_run = Path("run.py").read_text(encoding="utf-8")
+    check("run.py берёт список этапов из общего места",
+          "pipeline.STAGE_KEYS" in src_run and "pipeline.run_stage" in src_run)
+    src_ui = Path("src/ui.py").read_text(encoding="utf-8")
+    check("панель берёт список этапов оттуда же",
+          "pipeline.STAGES" in src_ui and "pipeline.STAGE_KEYS" in src_ui)
+
+    print("\n[41] Прогон из панели: прогресс, остановка, ошибки")
+    with tempfile.TemporaryDirectory() as tmp:
+        db.DB_PATH = Path(tmp) / "j.db"
+        db.connect().close()
+
+        job = jobs.Job("dossier")
+        job.report(3, 10, "ООО ПРИМЕР")
+        state = job.state()
+        check("прогресс считается в процентах", state["percent"] == 30, str(state))
+        check("видно, на чём именно стоим", state["label"] == "ООО ПРИМЕР")
+        check("у задачи есть человеческое название",
+              state["title"] == "Обойти сайты", state["title"])
+
+        # Остановка: поток не убиваем, а бросаем исключение из приёмника
+        # прогресса. Прогон прервётся на границе компании (Р-050).
+        job.stop()
+        check("после «стоп» следующий шаг прерывает прогон",
+              _raises(jobs.JobCancelled, lambda: job.report(4, 10, "ООО СЛЕДУЮЩЕЕ")))
+
+        check("нулевое «всего» не делит на ноль",
+              jobs.Job("score").state()["percent"] == 0)
+
+        # Живой лог: строки прогона видно в панели, не открывая файл.
+        tail_job = jobs.Job("score")
+        handler = jobs._TailHandler(tail_job)
+        logger_ = log.get("selftest")
+        logger_.addHandler(handler)
+        try:
+            logger_.info("обычная строка")
+            logger_.warning("тревожная строка")
+        finally:
+            logger_.removeHandler(handler)
+        check("строки прогона попали в панель", len(tail_job.lines) == 2,
+              str(list(tail_job.lines)))
+        check("предупреждение помечено значком",
+              tail_job.lines[1].startswith("⚠"), tail_job.lines[1])
+
+        # Настоящий прогон целиком: запуск, ожидание, результат.
+        done = jobs.start("score")
+        for _ in range(100):
+            if done.status != "running":
+                break
+            time.sleep(0.05)
+        check("этап из панели дошёл до конца", done.status == "done", done.status)
+        check("результат этапа виден в панели", "scored" in done.result, str(done.result))
+        check("после конца прогона панель свободна", jobs.busy() is False)
+
+        # Два прогона разом делили бы базу и дневной запас запросов.
+        blocker = jobs.Job("dossier")
+        jobs._current = blocker
+        check("второй прогон не запускается, пока идёт первый",
+              _raises(RuntimeError, lambda: jobs.start("score")))
+        blocker.status = "done"
+
+        # Упавший этап не должен утащить поток молча.
+        broken = jobs.Job("score")
+        jobs._current = broken
+        jobs._execute(broken)
+        check("прогон завершился, а не завис", broken.status in ("done", "failed"))
+
+    print("\n[42] Правка настроек из панели")
+    check("список файлов не пуст и у каждого есть пояснение",
+          all(item["title"] and item["about"] for item in settings.FILES.values()))
+    check("править можно и критерии, и тексты писем",
+          {"icp", "letter", "offer", "origin", "stoplist"} <= set(settings.FILES))
+
+    # ГЛАВНОЕ. Путь к файлу приходит не из браузера, а из белого списка.
+    check("чужой путь не превращается в файл",
+          _raises(settings.SettingsError, lambda: settings.resolve("../../.env")))
+    check("сохранить чужой путь тоже нельзя",
+          _raises(settings.SettingsError,
+                  lambda: settings.save("../../.env", "ANTHROPIC_API_KEY=x")))
+    check("ключей в списке файлов нет вовсе",
+          not any(".env" in str(item["path"]) for item in settings.FILES.values()))
+
+    check("сломанный YAML не сохраняется",
+          settings.validate("icp", "provider:\n  base_url: [не закрыт\n"))
+    check("в отказе назван номер строки",
+          "строка" in settings.validate("icp", "a: [\nb: 1\n")[0],
+          str(settings.validate("icp", "a: [\nb: 1\n")))
+    check("пустой файл не сохраняется",
+          settings.validate("letter", "   ") == ["файл пустой — сохранять нечего"])
+    check("подпись без имени не сохраняется",
+          settings.validate("origin", "просто текст"))
+    check("рабочий конфиг проходит проверку",
+          settings.validate("icp", Path("config/icp.yaml").read_text(encoding="utf-8"))
+          == [])
+
+    # Защита сильнее удобства: пауза меньше секунды к чужому серверу
+    # не сохранится, даже если её вписали руками в панели (Р-043).
+    broken_icp = Path("config/icp.yaml").read_text(encoding="utf-8").replace(
+        "pause_seconds: 2.0", "pause_seconds: 0.1")
+    problems = settings.validate("icp", broken_icp)
+    check("нарушение защиты не сохраняется через панель",
+          any("защита" in item for item in problems), str(problems))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Правим настоящую запись списка, но в свою папку.
+        settings.BACKUP_DIR = Path(tmp) / "backups"
+        target = Path(tmp) / "проба.txt"
+        settings.FILES["проба"] = {"path": target, "title": "Проба",
+                                   "kind": "text", "about": "для проверки"}
+        settings.save("проба", "первая версия")
+        check("файл записан", target.read_text(encoding="utf-8").strip() == "первая версия")
+        check("копии ещё нет — файла раньше не было", settings.backups("проба") == [])
+
+        settings.save("проба", "вторая версия")
+        copies = settings.backups("проба")
+        check("перед перезаписью сделана копия", len(copies) == 1, str(copies))
+        check("в копии лежит прежний текст",
+              "первая версия" in (settings.BACKUP_DIR / copies[0]["name"]).read_text(
+                  encoding="utf-8"))
+
+        settings.restore("проба", copies[0]["name"])
+        check("возврат к прежней версии работает",
+              "первая версия" in target.read_text(encoding="utf-8"))
+        check("выдуманное имя копии отклоняется",
+              _raises(settings.SettingsError,
+                      lambda: settings.restore("проба", "чужой.txt")))
+
+        for number in range(settings.KEEP_BACKUPS + 5):
+            settings.save("проба", f"версия {number}")
+        check("старые копии не копятся бесконечно",
+              len(settings.backups("проба")) <= settings.KEEP_BACKUPS,
+              str(len(settings.backups("проба"))))
+        del settings.FILES["проба"]
 
     print("\n[20] Сквозной прогон: досье → письмо → утренний список")
     with tempfile.TemporaryDirectory() as tmp:
@@ -1417,12 +1653,13 @@ def main() -> int:
         check("вакансия дошла до модели как факт досье",
               "холодные звонки" in captured.get("найм", {}).get("user", ""),
               captured.get("найм", {}).get("user", ""))
-        check("промпт велит брать вакансию первой",
-              "начинай письмо с него" in captured.get("найм", {}).get("system", ""))
+        check("промпт велит строить вопрос вокруг вакансии",
+              "вопрос в первом абзаце строится вокруг него"
+              in captured.get("найм", {}).get("system", ""))
         check("компания без фактов до модели не дошла",
               "пусто" not in captured, str(sorted(captured)))
         check("модель получила угол для продуктовой компании",
-              "круг покупателей уже" in captured.get("альта", {}).get("system", ""))
+              "круг покупателей конечный" in captured.get("альта", {}).get("system", ""))
         check("аутсорсеру ушёл другой угол",
               "специализацию" in captured.get("общее", {}).get("system", ""))
         check("модель получила факты из досье",

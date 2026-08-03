@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Оркестратор: запускает этапы системы по порядку.
+"""Оркестратор командной строки: запускает этапы системы.
+
+Всё то же самое есть в панели (`--stage ui`), и запускает она те же самые
+функции: список этапов и порядок вызовов лежат в `src/pipeline.py`, чтобы
+командная строка и панель не разъехались.
 
 Примеры:
-    python run.py                          # полный прогон: сбор + утренний список
-    python run.py --stage collect          # только сбор сигналов
-    python run.py --stage report           # только пересобрать список
-    python run.py --dry-run                # ничего не пишем, только смотрим
-    python run.py --stage collect --raw    # показать сырой JSON первой вакансии
+    python3 run.py --stage ui               # панель: этапы, письма, настройки
+    python3 run.py --stage targets          # найти компании
+    python3 run.py --stage morning          # пересобрать утренний список
+    python3 run.py --dry-run --stage dossier  # ничего не пишем, только смотрим
 """
 
 from __future__ import annotations
@@ -16,15 +19,9 @@ import os
 import sys
 from pathlib import Path
 
-import yaml
-
-from src import (collect, compose, dossier, guard, log, metrics,
-                 outreach, report, scoring, targets, ui)
-from src.sources import registries
+from src import log, pipeline
 
 ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / "config" / "signals.yaml"
-ICP_CONFIG_PATH = ROOT / "config" / "icp.yaml"
 
 
 def load_env() -> None:
@@ -44,39 +41,26 @@ def load_env() -> None:
         os.environ.setdefault(key.strip(), value.strip())
 
 
-def load_config(path: Path) -> dict:
-    if not path.exists():
-        print(f"Не найден конфиг {path}", file=sys.stderr)
-        sys.exit(1)
-    with path.open(encoding="utf-8") as handle:
-        return yaml.safe_load(handle) or {}
+def stage_help() -> str:
+    """Справка по этапам собирается из того же списка, что и кнопки панели."""
+    lines = [f"{item['key']} — {item['detail']}" for item in pipeline.STAGES]
+    lines.append("ui — панель в браузере: те же этапы кнопками, плюс письма, "
+                 "воронка, настройки и логи")
+    lines.append("discover/enrich — половинки этапа targets по отдельности")
+    lines.append("mark — отметить статус: mark sent ИНН ИНН")
+    lines.append("telegram — отправить свежий утренний список в Telegram")
+    lines.append("collect/report — старый сбор сигналов и его отчёт")
+    return "; ".join(lines)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="GTM-система: сбор сигналов и утренний список")
+    parser = argparse.ArgumentParser(
+        description="GTM-система: поиск компаний, досье, письма, утренний список")
     parser.add_argument(
         "--stage",
-        choices=["targets", "discover", "enrich", "rejudge", "dossier",
-                 "compose", "followup", "morning", "telegram", "mark", "stats",
-                 "registries", "score", "ui", "cleanup", "collect", "report", "all"],
+        choices=pipeline.STAGE_KEYS + pipeline.EXTRA_KEYS,
         default="all",
-        help=(
-            "targets — построить целевой список через Checko (discover + enrich); "
-            "discover/enrich — половинки этого этапа по отдельности; "
-            "rejudge — пересмотреть вердикты по уже скачанным данным, без запросов к API; "
-            "dossier — обойти сайты прошедших ICP и классифицировать их; "
-            "compose — написать письма по досье; "
-            "morning — собрать утренний список с письмами; "
-            "followup — написать дожимы тем, кто не ответил; "
-            "telegram — отправить свежий утренний список в Telegram; "
-            "mark — отметить статус: mark sent ИНН ИНН ...; "
-            "stats — воронка за две недели и самодиагностика; "
-            "registries — импорт реестров Минцифры из data/registries/; "
-            "score — пересчитать баллы схождения сигналов (без запросов наружу); "
-            "ui — открыть локальную панель на 127.0.0.1:8765; "
-            "cleanup — убрать из базы личные адреса, сохранённые до появления фильтра; "
-            "collect/report — сбор сигналов и утренний список"
-        ),
+        help=stage_help(),
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -93,100 +77,21 @@ def main() -> int:
         "rest", nargs="*",
         help="аргументы этапа mark: сначала статус, потом ИНН через пробел",
     )
-    parser.add_argument("--config", type=Path, default=CONFIG_PATH)
     args = parser.parse_args()
 
     load_env()
     logger = log.setup(verbose=args.verbose)
-    log.set_stage(args.stage)
     logger.info("=" * 70)
     logger.info("Запуск: этап=%s dry_run=%s", args.stage, args.dry_run)
 
     try:
-        if args.stage == "ui":
-            ui.serve(config=load_config(ICP_CONFIG_PATH))
-            return 0
-
-        if args.stage == "registries":
-            registries.run(dry_run=args.dry_run)
-            return 0
-
-        if args.stage == "score":
-            scoring.recompute(load_config(ICP_CONFIG_PATH), dry_run=args.dry_run)
-            return 0
-
-        if args.stage == "stats":
-            return 0 if metrics.run(args.days) == 0 else 0
-
-        if args.stage == "mark":
-            if len(args.rest) < 2:
-                print("Как пользоваться:", file=sys.stderr)
-                print("  python3 run.py --stage mark sent 7703283933 5018046069",
-                      file=sys.stderr)
-                print("\nСтатусы:", file=sys.stderr)
-                for name, meaning in outreach.STATUSES.items():
-                    print(f"  {name:<9} — {meaning}", file=sys.stderr)
-                return 1
-            outreach.mark(args.rest[0], args.rest[1:], dry_run=args.dry_run)
-            return 0
-
-        if args.stage in ("targets", "discover", "enrich", "rejudge"):
-            icp_config = load_config(ICP_CONFIG_PATH)
-            if not guard.enforce(icp_config):
-                return 2
-            if args.stage == "rejudge":
-                targets.rejudge(icp_config, dry_run=args.dry_run)
-            else:
-                if args.stage in ("targets", "discover"):
-                    targets.discover(icp_config, dry_run=args.dry_run)
-                if args.stage in ("targets", "enrich"):
-                    targets.enrich(icp_config, dry_run=args.dry_run)
-
-        if args.stage == "cleanup":
-            targets.cleanup_contacts(dry_run=args.dry_run)
-
-        if args.stage == "dossier":
-            icp_config = load_config(ICP_CONFIG_PATH)
-            if not guard.enforce(icp_config):
-                return 2
-            dossier.run(icp_config, dry_run=args.dry_run)
-            scoring.recompute(icp_config, dry_run=args.dry_run)
-
-        if args.stage == "compose":
-            icp_config = load_config(ICP_CONFIG_PATH)
-            if not guard.enforce(icp_config):
-                return 2
-            compose.run(icp_config, dry_run=args.dry_run)
-            scoring.recompute(icp_config, dry_run=args.dry_run)
-
-        if args.stage == "followup":
-            icp_config = load_config(ICP_CONFIG_PATH)
-            if not guard.enforce(icp_config):
-                return 2
-            compose.run_followups(icp_config, dry_run=args.dry_run)
-
-        if args.stage == "telegram":
-            report.send_to_telegram(load_config(ICP_CONFIG_PATH))
-
-        if args.stage == "morning":
-            icp_config = load_config(ICP_CONFIG_PATH)
-            path = report.build_morning(icp_config, dry_run=args.dry_run)
-            if path:
-                logger.info("Открыть список: %s", path)
-                if icp_config.get("report", {}).get("telegram", True):
-                    report.send_to_telegram(icp_config)
-
-        if args.stage in ("collect", "all"):
-            config = load_config(args.config)
-            guard.enforce(config, kind="signals")
-            collect.run(config, dry_run=args.dry_run, raw=args.raw)
-
-        if args.stage in ("report", "all"):
-            config = load_config(args.config)
-            path = report.build(config, dry_run=args.dry_run)
-            if path:
-                logger.info("Открыть список: %s", path)
-
+        result = pipeline.run_stage(args.stage, dry_run=args.dry_run,
+                                    days=args.days, rest=args.rest, raw=args.raw)
+        if result:
+            logger.info("Итог: %s", ", ".join(f"{k} {v}" for k, v in result.items()))
+    except pipeline.StageError as exc:
+        logger.error("%s", exc)
+        return 2
     except KeyboardInterrupt:
         logger.warning("Прервано пользователем")
         return 130
@@ -200,7 +105,8 @@ def main() -> int:
 
     if errors:
         # Код 2 — чтобы cron прислал письмо: что-то сломалось по-настоящему.
-        logger.error("Прогон завершён с ошибками: %d (всего замечаний %d)", errors, len(problems))
+        logger.error("Прогон завершён с ошибками: %d (всего замечаний %d)",
+                     errors, len(problems))
         return 2
     if problems:
         logger.warning("Прогон завершён с замечаниями: %d шт. (см. лог и конец отчёта)",

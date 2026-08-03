@@ -203,9 +203,18 @@ def discover(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
         conn.close()
         return counters
 
+    # Прогресс считаем по парам ОКВЭД×регион: это единственная величина,
+    # известная заранее. Сколько компаний найдётся, до запроса не знает никто.
+    pairs = [(okved, region)
+             for okved in target_cfg.get("okved", [])
+             for region in target_cfg.get("regions", [])]
+    done_pairs = 0
+
     try:
         for okved in target_cfg.get("okved", []):
             for region in target_cfg.get("regions", []):
+                done_pairs += 1
+                log.progress(done_pairs, len(pairs), f"{okved} / {region['name']}")
                 if buffered >= buffer_target or counters["requests"] >= max_search_requests:
                     break
 
@@ -330,8 +339,9 @@ def enrich(config: dict[str, Any], dry_run: bool = False) -> dict[str, int]:
         return counters
 
     try:
-        for row in candidates:
+        for index, row in enumerate(candidates, start=1):
             inn = row["inn"]
+            log.progress(index, len(candidates), row["name"] or inn)
             try:
                 company = CheckoClient.parse_company(client.company(inn))
             except BudgetExhausted:

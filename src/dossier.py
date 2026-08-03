@@ -171,8 +171,9 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
                 "facts": 0, "facts_dropped": 0, "hiring": 0, "facts_ok": 0, "tech": 0}
     by_type: dict[str, int] = {}
 
-    for row in rows:
+    for index, row in enumerate(rows, start=1):
         name = row["name"]
+        log.progress(index, len(rows), name)
         raw_site = (row["site"] or "").strip()
 
         if not raw_site:
