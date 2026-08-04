@@ -197,10 +197,17 @@ function render(job) {
   const words = {running: 'идёт', done: 'готово', failed: 'ошибка',
                  cancelled: 'остановлено'};
   const counted = job.total ? (job.done + ' из ' + job.total) : '';
-  const percent = job.total ? job.percent : (running ? 8 : 100);
+  const percent = (job.total || job.steps > 1) ? job.percent : (running ? 8 : 100);
+
+  // У полного прогона в заголовке видно, на каком он шаге: иначе непонятно,
+  // сколько ещё ждать.
+  const step = job.steps > 1
+    ? ' — шаг ' + job.step + ' из ' + job.steps +
+      (job.step_title ? ': ' + esc(job.step_title) : '')
+    : '';
 
   const head = '<div class="row" style="justify-content:space-between">' +
-    '<b>' + esc(job.title) + (job.dry_run ? ' — проба' : '') + '</b>' +
+    '<b>' + esc(job.title) + step + (job.dry_run ? ' — проба' : '') + '</b>' +
     '<span class="muted">' + words[job.status] + ' · ' + job.seconds + ' с</span></div>';
 
   const bar = '<div class="bar ' + (running ? '' : job.status) + '"><i style="width:' +
@@ -298,8 +305,30 @@ def run_page() -> bytes:
                             ("писем готово", drafts)))
 
     stages = []
+    primary = ""
     for item in pipeline.STAGES:
         costs = f' · тратит: {esc(item["costs"])}' if item["costs"] else ""
+
+        # Главная кнопка живёт отдельной карточкой наверху: в общем списке
+        # она потерялась бы среди десяти одинаковых строк, а нажимать её
+        # предстоит каждое утро.
+        if item.get("primary"):
+            steps = " → ".join(pipeline.describe(key)["title"]
+                               for key in pipeline.DAILY)
+            primary = f"""<div class="card" style="border-color:#3b5c93">
+<div class="row" style="justify-content:space-between">
+  <div class="who"><b style="font-size:17px">{esc(item['title'])}</b>
+    <div class="muted">{esc(steps)}</div>
+    <div class="muted">{esc(item['minutes'])}{costs}</div></div>
+  <div class="row">
+    <button class="primary stage-btn" style="font-size:15px;padding:10px 20px"
+            onclick="runStage('{item['key']}', false)">запустить всё</button>
+    <button class="stage-btn" onclick="runStage('{item['key']}', true)"
+            title="выполнить всё, кроме записи в базу">проба</button>
+  </div>
+</div></div>"""
+            continue
+
         stages.append(f"""<div class="stage">
   <div class="who"><b>{esc(item['title'])}</b>
     <span class="muted">{esc(item['detail'])}</span>
@@ -313,11 +342,12 @@ def run_page() -> bytes:
 </div>""")
 
     body = f"""<div class="tiles">{tiles}</div>
+{primary}
 <div class="card"><h2>Ход прогона</h2><div id="job"></div></div>
-<div class="card"><h2>Этапы</h2>
-<p class="muted">Порядок сверху вниз — это и есть порядок ежедневной работы.
-«Проба» делает всё, кроме записи: удобно проверить настройки, не тратя
-дневной запас запросов.</p>
+<div class="card"><h2>Этапы по отдельности</h2>
+<p class="muted">То же самое, но по шагам — когда нужен один этап, а не весь
+прогон. Порядок сверху вниз тот же. «Проба» делает всё, кроме записи:
+удобно проверить настройки, не тратя дневной запас запросов.</p>
 {''.join(stages)}</div>"""
     return page("Прогон", "/", body, onload="poll();")
 

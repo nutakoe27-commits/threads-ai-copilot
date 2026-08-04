@@ -83,6 +83,23 @@ def progress(done: int, total: int, label: str = "") -> None:
         _progress_sink(done, total, label)
 
 
+# Шаг внутри составного прогона: «второй из пяти, обходим сайты».
+# Отдельно от progress, потому что это другая величина: там компании внутри
+# этапа, здесь этапы внутри прогона.
+_phase_sink: Any = None
+
+
+def set_phase_sink(sink: Any) -> None:
+    global _phase_sink
+    _phase_sink = sink
+
+
+def phase(index: int, total: int, title: str) -> None:
+    """Сообщает, какой этап составного прогона начался."""
+    if _phase_sink is not None:
+        _phase_sink(index, total, title)
+
+
 class _ProblemCollector(logging.Handler):
     """Складывает WARNING и ERROR в список, чтобы показать их в отчёте."""
 

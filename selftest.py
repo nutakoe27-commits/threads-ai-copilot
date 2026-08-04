@@ -1371,8 +1371,8 @@ def main() -> int:
           all(item["title"] and item["detail"] for item in pipeline.STAGES),
           str([item["key"] for item in pipeline.STAGES if not item["detail"]]))
     check("порядок этапов — это порядок работы",
-          [item["key"] for item in pipeline.STAGES][:3]
-          == ["targets", "dossier", "compose"]
+          [item["key"] for item in pipeline.STAGES][:4]
+          == ["daily", "targets", "dossier", "compose"]
           and pipeline.STAGE_KEYS.index("followup") < pipeline.STAGE_KEYS.index("morning"),
           str(pipeline.STAGE_KEYS))
     check("этапы, тратящие деньги, помечены",
@@ -1778,6 +1778,106 @@ def main() -> int:
         db.connect().close()
         check("на пустой базе страница объясняет, откуда берутся письма",
               "отмечаете их" in ui.sent_page().decode("utf-8"))
+
+    print("\n[47] Полный прогон одной кнопкой")
+    check("полный прогон стоит первым в списке этапов",
+          pipeline.STAGES[0]["key"] == "daily", pipeline.STAGES[0]["key"])
+    check("он помечен как главный", pipeline.STAGES[0].get("primary") is True)
+    check("последовательность — это ежедневная работа",
+          pipeline.DAILY == ["targets", "dossier", "compose", "followup", "morning"],
+          str(pipeline.DAILY))
+    check("все шаги полного прогона существуют как этапы",
+          all(key in pipeline.STAGE_KEYS for key in pipeline.DAILY),
+          str([k for k in pipeline.DAILY if k not in pipeline.STAGE_KEYS]))
+
+    # Порядок не произвольный: письма пишутся по досье, а список собирается
+    # из писем. Перепутанный порядок дал бы пустой результат без объяснения.
+    check("досье раньше писем и список последним",
+          pipeline.DAILY.index("dossier") < pipeline.DAILY.index("compose")
+          < pipeline.DAILY.index("morning"), str(pipeline.DAILY))
+
+    calls: list[str] = []
+    phases: list[tuple] = []
+
+    def fake_stage(stage, dry_run=False, **kwargs):
+        calls.append(stage)
+        return {"сделано": 1}
+
+    original_stage = pipeline.run_stage
+    original_phase = log._phase_sink
+    log.set_phase_sink(lambda index, total, title: phases.append((index, total, title)))
+    pipeline.run_stage = fake_stage
+    try:
+        result = pipeline.run_daily()
+    finally:
+        pipeline.run_stage = original_stage
+        log.set_phase_sink(original_phase)
+
+    check("этапы вызваны все и по порядку", calls == pipeline.DAILY, str(calls))
+    check("о каждом шаге сообщено в панель",
+          [p[0] for p in phases] == list(range(1, len(pipeline.DAILY) + 1)),
+          str(phases))
+    check("у шага человеческое название",
+          phases[1][2] == "Обойти сайты", str(phases[1]))
+    # Счётчики этапов называются одинаково — без приставки последний затёр бы
+    # остальные, и итог показал бы работу одного этапа вместо пяти.
+    check("счётчики этапов не затирают друг друга",
+          len(result) == len(pipeline.DAILY), str(result))
+    check("в итоге видно, какой этап что сделал",
+          "dossier: сделано" in result, str(result))
+
+    # Упавший этап не должен пускать прогон дальше: следующий работает
+    # с тем, что произвёл предыдущий.
+    def failing_stage(stage, dry_run=False, **kwargs):
+        calls.append(stage)
+        if stage == "dossier":
+            raise RuntimeError("сайты недоступны")
+        return {}
+
+    calls.clear()
+    pipeline.run_stage = failing_stage
+    try:
+        check("падение этапа останавливает прогон",
+              _raises(RuntimeError, pipeline.run_daily))
+    finally:
+        pipeline.run_stage = original_stage
+    check("после падения следующие этапы не запускались",
+          calls == ["targets", "dossier"], str(calls))
+
+    # Полоса у составного прогона показывает весь прогон, а не текущий этап:
+    # иначе она четыре раза откатывается к нулю и выглядит как зависание.
+    job = jobs.Job("daily")
+    job.report_phase(3, 5, "Написать письма")
+    job.report(1, 2, "ООО ПРИМЕР")
+    check("полоса считает весь прогон, а не этап",
+          job.state()["percent"] == 50, str(job.state()["percent"]))
+    check("в состоянии виден номер шага",
+          job.state()["step"] == 3 and job.state()["steps"] == 5)
+    check("название шага доходит до панели",
+          job.state()["step_title"] == "Написать письма")
+    check("новый шаг обнуляет счётчик компаний",
+          (job.report_phase(4, 5, "Дожимы"), job.state()["done"])[1] == 0)
+    # Между этапами прогон стоит дольше всего — остановка обязана срабатывать
+    # и здесь, а не только внутри цикла по компаниям.
+    job.stop()
+    check("остановка срабатывает и на границе этапов",
+          _raises(jobs.JobCancelled, lambda: job.report_phase(5, 5, "Список")))
+
+    check("у одиночного этапа шаг один из одного",
+          jobs.Job("score").state()["steps"] == 1)
+
+    # Полоса, замершая на 80% при слове «готово», читается как поломка.
+    finished = jobs.Job("daily")
+    finished.report_phase(5, 5, "Собрать утренний список")
+    finished.status = "done"
+    check("завершённый прогон показывает полную полосу",
+          finished.state()["percent"] == 100, str(finished.state()["percent"]))
+    # А вот остановленный — там, где встал: это полезно знать.
+    stopped = jobs.Job("daily")
+    stopped.report_phase(2, 5, "Обойти сайты")
+    stopped.status = "cancelled"
+    check("остановленный показывает, где встал",
+          stopped.state()["percent"] == 20, str(stopped.state()["percent"]))
 
     print("\n[20] Сквозной прогон: досье → письмо → утренний список")
     with tempfile.TemporaryDirectory() as tmp:

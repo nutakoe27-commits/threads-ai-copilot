@@ -57,6 +57,10 @@ class Job:
         self.done = 0
         self.total = 0
         self.label = ""
+        # Шаг составного прогона. У одиночного этапа шаг один из одного.
+        self.step = 1
+        self.steps = 1
+        self.step_title = ""
         self.result: dict[str, Any] = {}
         self.error = ""
         self.lines: deque[str] = deque(maxlen=TAIL_LINES)
@@ -70,6 +74,19 @@ class Job:
             raise JobCancelled(f"Прогон остановлен на {done} из {total}")
         self.done, self.total, self.label = done, total, label
 
+    def report_phase(self, index: int, total: int, title: str) -> None:
+        """Начался следующий этап составного прогона.
+
+        Счётчик компаний обнуляется: он относится к этапу, а не к прогону.
+        Здесь же ловится «стоп» — иначе между этапами остановка не сработала бы,
+        а как раз между ними прогон и стоит дольше всего.
+        """
+        if self._stop.is_set():
+            raise JobCancelled(f"Прогон остановлен перед этапом «{title}»")
+        self.step, self.steps, self.step_title = index, total, title
+        self.done = self.total = 0
+        self.label = ""
+
     def stop(self) -> None:
         self._stop.set()
         self.lines.append("Остановка запрошена — прогон прервётся "
@@ -79,13 +96,30 @@ class Job:
 
     def state(self) -> dict[str, Any]:
         seconds = (self.finished or time.time()) - self.started
-        percent = int(self.done * 100 / self.total) if self.total else 0
+        inside = (self.done / self.total) if self.total else 0.0
+
+        # У составного прогона полоса показывает весь прогон, а не текущий
+        # этап: иначе она четыре раза откатывается к нулю, и человек решает,
+        # что всё зависло.
+        if self.status == "done":
+            # Дошли до конца — полоса обязана это показать. Без этого она
+            # замирает на последнем шаге: он засчитан только когда начался
+            # следующий, а следующего нет.
+            percent = 100
+        elif self.steps > 1:
+            percent = int((self.step - 1 + inside) * 100 / self.steps)
+        else:
+            percent = int(inside * 100)
+
         return {
             "stage": self.stage,
             "title": pipeline.describe(self.stage)["title"],
             "status": self.status,
             "done": self.done,
             "total": self.total,
+            "step": self.step,
+            "steps": self.steps,
+            "step_title": self.step_title,
             "percent": percent,
             "label": self.label,
             "seconds": round(seconds, 1),
@@ -148,6 +182,7 @@ def _execute(job: Job) -> None:
     tail = _TailHandler(job)
     root.addHandler(tail)
     log.set_progress_sink(job.report)
+    log.set_phase_sink(job.report_phase)
 
     try:
         logger.info("Панель запустила этап %s%s", job.stage,
@@ -171,6 +206,7 @@ def _execute(job: Job) -> None:
     finally:
         job.finished = time.time()
         log.set_progress_sink(None)
+        log.set_phase_sink(None)
         root.removeHandler(tail)
 
 

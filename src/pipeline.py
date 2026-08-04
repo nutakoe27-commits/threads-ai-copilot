@@ -38,7 +38,21 @@ class StageError(RuntimeError):
 # Порядок здесь — это порядок ежедневной работы. Панель рисует кнопки
 # в этом же порядке, поэтому «сверху вниз» на экране и есть правильный
 # порядок запуска.
+# ПОЛНЫЙ ПРОГОН. Ровно та последовательность, которая описана в START.md
+# как ежедневная работа. Список здесь один: если завтра между досье и письмом
+# появится новый этап, он попадёт и в кнопку, и в инструкцию сразу.
+DAILY: list[str] = ["targets", "dossier", "compose", "followup", "morning"]
+
 STAGES: list[dict[str, Any]] = [
+    {
+        "key": "daily",
+        "title": "Полный прогон",
+        "detail": "Найти компании → обойти сайты → написать письма → дожимы → "
+                  "утренний список. Всё подряд, одной кнопкой.",
+        "minutes": "8–20 минут",
+        "costs": "запросы Checko и к модели",
+        "primary": True,
+    },
     {
         "key": "targets",
         "title": "Найти компании",
@@ -160,6 +174,42 @@ def _icp() -> dict[str, Any]:
     return config
 
 
+def run_daily(dry_run: bool = False) -> dict[str, Any]:
+    """Полный дневной прогон: все этапы подряд, в правильном порядке.
+
+    ЗАЧЕМ. Нажимать пять кнопок по очереди, дожидаясь каждой, — это работа
+    оператора, а не владельца. К тому же порядок этапов не произвольный,
+    и человек, перепутавший его, получит пустой результат без объяснения.
+
+    ЕСЛИ ЭТАП УПАЛ — прогон останавливается, а не идёт дальше. Каждый
+    следующий этап работает с тем, что произвёл предыдущий: писать письма
+    по недособранным досье значит потратить дорогую модель на мусор.
+    В логе видно, на каком шаге всё встало и что успело сделаться до него.
+    """
+    collected: dict[str, Any] = {}
+
+    for index, stage in enumerate(DAILY, start=1):
+        title = describe(stage)["title"]
+        log.phase(index, len(DAILY), title)
+        logger.info("=" * 60)
+        logger.info("Шаг %d из %d: %s", index, len(DAILY), title)
+
+        try:
+            result = run_stage(stage, dry_run=dry_run) or {}
+        except Exception:
+            logger.error("Прогон остановлен на шаге %d из %d (%s). "
+                         "Сделанное до него сохранено.",
+                         index, len(DAILY), title)
+            raise
+
+        # Счётчики этапов называются одинаково («written», «checked»),
+        # поэтому склеиваем с приставкой — иначе последний затрёт остальные.
+        for key, value in result.items():
+            collected[f"{stage}: {key}"] = value
+
+    return collected
+
+
 def run_stage(stage: str, dry_run: bool = False, days: int = 14,
               rest: list[str] | None = None, raw: bool = False) -> dict[str, Any]:
     """Запускает один этап. Единственная точка входа для всех запускающих.
@@ -169,6 +219,9 @@ def run_stage(stage: str, dry_run: bool = False, days: int = 14,
     """
     rest = rest or []
     log.set_stage(stage)
+
+    if stage == "daily":
+        return run_daily(dry_run=dry_run)
 
     if stage in ("targets", "discover", "enrich", "rejudge"):
         config = _icp()
