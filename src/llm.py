@@ -57,6 +57,21 @@ def _client() -> Any:
     return anthropic.Anthropic()
 
 
+# Во сколько раз поднимать потолок ответа при повторе и сколько раз пробовать.
+#
+# ЗАЧЕМ. Ответ, упёршийся в потолок, обрывается на полуслове — и ломается
+# именно как «модель вернула не-JSON», хотя модель ни при чём и текст был
+# почти готов. Токены при этом уже потрачены, а результата нет.
+# Один повтор с удвоенным потолком дешевле потерянного письма
+# (DECISIONS.md, Р-052).
+RETRY_FACTOR = 2
+MAX_ATTEMPTS = 2
+
+# Выше этого не поднимаем даже при повторе: если ответ не уложился, дело
+# не в потолке, а в задаче.
+TOKEN_CEILING = 16384
+
+
 def classify(system_prompt: str, user_content: str, schema: dict[str, Any],
              max_tokens: int = 1024, model: str | None = None) -> dict[str, Any]:
     """Ответ по строгой схеме. Модель задаёт вызывающий.
@@ -67,30 +82,56 @@ def classify(system_prompt: str, user_content: str, schema: dict[str, Any],
     `model` обязателен по смыслу, хотя и не по сигнатуре: значение по
     умолчанию — самая дешёвая модель, и именно из-за него письма полгода
     писал Haiku. Каждый вызывающий указывает модель явно.
+
+    Если ответ обрывается по потолку токенов, запрос повторяется один раз
+    с удвоенным потолком. Это не догадка: обрыв виден по `stop_reason`.
     """
     client = _client()
     chosen = model or MODEL_CLASSIFY
-    logger.debug("Запрос к %s, схема из %d полей",
-                 chosen, len(schema.get("properties", {})))
-    try:
-        response = client.messages.create(
-            model=chosen,
-            max_tokens=max_tokens,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_content}],
-            output_config={"format": {"type": "json_schema", "schema": schema}},
-        )
-    except Exception as exc:  # noqa: BLE001 — наверх отдаём один тип ошибки
-        raise LLMError(f"Запрос к модели не удался: {exc}") from exc
+    limit = max_tokens
 
-    if response.stop_reason == "refusal":
-        raise LLMError("Модель отказалась отвечать на этот запрос")
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        logger.debug("Запрос к %s, схема из %d полей, потолок %d",
+                     chosen, len(schema.get("properties", {})), limit)
+        try:
+            response = client.messages.create(
+                model=chosen,
+                max_tokens=limit,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_content}],
+                output_config={"format": {"type": "json_schema", "schema": schema}},
+            )
+        except Exception as exc:  # noqa: BLE001 — наверх отдаём один тип ошибки
+            raise LLMError(f"Запрос к модели не удался: {exc}") from exc
 
-    text = next((block.text for block in response.content if block.type == "text"), "")
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise LLMError(f"Модель вернула не-JSON: {text[:200]}") from exc
+        if response.stop_reason == "refusal":
+            raise LLMError("Модель отказалась отвечать на этот запрос")
+
+        text = next((block.text for block in response.content
+                     if block.type == "text"), "")
+
+        # Обрыв по потолку — единственный случай, когда повтор осмыслен.
+        # Разбирать оборванный JSON и «дочинивать» его нельзя: получится
+        # письмо, обрезанное на полуслове, и никто этого не заметит.
+        truncated = response.stop_reason == "max_tokens"
+        if truncated and attempt < MAX_ATTEMPTS and limit < TOKEN_CEILING:
+            limit = min(limit * RETRY_FACTOR, TOKEN_CEILING)
+            logger.warning(
+                "Ответ не уложился в %d токенов и оборвался — повторяю "
+                "с потолком %d", max_tokens, limit)
+            continue
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            if truncated:
+                raise LLMError(
+                    f"Ответ оборвался по потолку в {limit} токенов и остался "
+                    f"неполным. Поднимите max_tokens у вызывающего этапа."
+                ) from exc
+            raise LLMError(f"Модель вернула не-JSON: {text[:200]}") from exc
+
+    raise LLMError("Не удалось получить ответ по схеме")
 
 
 def write(system_prompt: str, user_content: str, max_tokens: int = 2048) -> str:

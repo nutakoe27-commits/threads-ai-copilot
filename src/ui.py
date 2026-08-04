@@ -11,6 +11,7 @@
   Прогон     — запустить любой этап, видеть прогресс и живой лог,
                остановить на полпути.
   Письма     — прочитать, скопировать кнопкой, отметить статус.
+  Отправленные — что уже ушло, с ответом или без.
   Воронка    — конверсии по дням и предупреждение о падении.
   Настройки  — править критерии отбора и все тексты писем, с проверкой
                перед записью и копией предыдущей версии.
@@ -257,8 +258,8 @@ def esc(value: Any) -> str:
     return html_module.escape(str(value if value is not None else ""))
 
 
-TABS = [("/", "Прогон"), ("/letters", "Письма"), ("/stats", "Воронка"),
-        ("/settings", "Настройки"), ("/logs", "Логи")]
+TABS = [("/", "Прогон"), ("/letters", "Письма"), ("/sent", "Отправленные"),
+        ("/stats", "Воронка"), ("/settings", "Настройки"), ("/logs", "Логи")]
 
 
 def page(title: str, active: str, body: str, refresh: int = 0,
@@ -400,6 +401,110 @@ def letters_page() -> bytes:
     return page("Письма", "/letters", "".join(parts))
 
 
+# ---------------------------------------------------------- отправленные
+
+# Как показывать статус компании. Ключ — то, что лежит в outreach_status.
+STATUS_LOOK = {
+    "sent": ("отправлено", ""),
+    "replied": ("ответили", "hot"),
+    "meeting": ("договорились", "hot"),
+    "refused": ("просили не писать", ""),
+    "bounced": ("адрес не существует", ""),
+}
+
+
+def sent_page(status: str = "") -> bytes:
+    """Что уже ушло. Отдельная вкладка, потому что это другой вопрос.
+
+    На вкладке «Письма» вопрос «что отправить сегодня». Здесь — «что я уже
+    отправил и что из этого вышло». Смешивать их значит каждое утро глазами
+    отделять одно от другого.
+    """
+    conn = db.connect()
+
+    query = """
+        SELECT t.id, t.inn, t.step, t.subject, t.body, t.why, t.sent_at,
+               c.name, c.contact_email, c.site_url, c.outreach_status,
+               c.outreach_at, c.touch_count, c.signal_score
+        FROM touches t JOIN companies c ON c.inn = t.inn
+        WHERE t.status = 'sent'
+    """
+    params: list[Any] = []
+    if status:
+        query += " AND c.outreach_status = ?"
+        params.append(status)
+    query += " ORDER BY t.sent_at DESC, t.step DESC LIMIT 200"
+
+    rows = conn.execute(query, params).fetchall()
+    counts = dict(conn.execute(
+        "SELECT outreach_status, COUNT(*) FROM companies "
+        "WHERE outreach_status IS NOT NULL AND outreach_status != 'new' "
+        "GROUP BY outreach_status").fetchall())
+    conn.close()
+
+    total = sum(counts.values())
+    replied = counts.get("replied", 0) + counts.get("meeting", 0)
+    share = f"{replied * 100 / total:.0f}%" if total else "—"
+
+    tiles = "".join(
+        f'<div class="tile"><div class="n">{value}</div>'
+        f'<div class="l">{esc(name)}</div></div>'
+        for name, value in [("всего отправлено", total),
+                            ("ответили", replied),
+                            ("доля ответов", share)])
+
+    def chip(key: str, name: str) -> str:
+        on = ' style="background:#6ea8fe;color:#10131a"' if key == status else ""
+        href = f"/sent?status={key}" if key else "/sent"
+        return f'<a class="btn" href="{href}"{on}>{esc(name)}</a>'
+
+    filters = " ".join([chip("", "все")]
+                       + [chip(key, f"{look[0]} ({counts.get(key, 0)})")
+                          for key, look in STATUS_LOOK.items()
+                          if counts.get(key)])
+
+    parts = [f'<div class="tiles">{tiles}</div>',
+             f'<div class="card"><div class="row">{filters}</div></div>']
+
+    if not rows:
+        parts.append(
+            '<div class="card"><b>Отправленных писем нет.</b>'
+            '<p class="muted">Письма попадают сюда, когда вы отмечаете их '
+            'кнопкой «отправлено» на вкладке «Письма».</p></div>')
+        return page("Отправленные", "/sent", "".join(parts))
+
+    for row in rows:
+        label, tone = STATUS_LOOK.get(row["outreach_status"] or "sent",
+                                      (row["outreach_status"] or "—", ""))
+        step_label = "первое письмо" if row["step"] == 1 else f"дожим {row['step'] - 1}"
+        when = (row["sent_at"] or "")[:16].replace("T", " ")
+
+        parts.append(f"""<div class="card">
+<div class="row" style="justify-content:space-between">
+  <div><b>{esc(row['name'])}</b>
+    <span class="muted"> — {step_label} · {esc(when)}</span></div>
+  <span class="badge {tone}">{esc(label)}</span>
+</div>
+<div class="muted">{esc(row['why'] or '')}</div>
+<div class="row" style="margin-top:8px">
+  {'<a class="btn" href="' + esc(row['site_url']) + '" target="_blank">сайт</a>' if row['site_url'] else ''}
+  <span class="muted">{esc(row['contact_email'] or 'почты нет')}</span>
+  <span class="muted">ИНН {esc(row['inn'])}</span>
+  <span class="muted">касаний: {row['touch_count'] or 1}</span>
+</div>
+<div style="margin-top:10px"><b>Тема:</b> {esc(row['subject'])}</div>
+<details><summary class="muted" style="cursor:pointer;margin:8px 0">текст письма</summary>
+<pre class="letter">{esc(row['body'])}</pre></details>
+<div class="row">
+  <button onclick="mark('{row['inn']}','replied')">ответили</button>
+  <button onclick="mark('{row['inn']}','meeting')">договорились</button>
+  <button class="danger" onclick="mark('{row['inn']}','refused')">просили не писать</button>
+  <button class="danger" onclick="mark('{row['inn']}','bounced')">адрес не существует</button>
+</div></div>""")
+
+    return page("Отправленные", "/sent", "".join(parts))
+
+
 # ---------------------------------------------------------------- воронка
 
 def stats_page() -> bytes:
@@ -533,6 +638,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(run_page())
             elif parsed.path == "/letters":
                 self._send(letters_page())
+            elif parsed.path == "/sent":
+                self._send(sent_page(query.get("status", [""])[0]))
             elif parsed.path == "/stats":
                 self._send(stats_page())
             elif parsed.path == "/settings":

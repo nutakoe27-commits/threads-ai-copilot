@@ -1,25 +1,35 @@
-"""Этап 3б: генерация письма по досье.
+"""Этап 3б: письмо по досье.
+
+КАК УСТРОЕНО. Письмо не генерируется целиком. Оно собирается из шаблона
+`config/prompts/template.md`, в котором модель заполняет две вставки:
+
+  {вопрос}    первый абзац — вопрос про то, как у них устроен поиск клиентов;
+  {признаки}  перечень признаков ИХ покупателя.
+
+Остальное — предложение, просьба, подпись — фиксированный текст. Он не
+обязан меняться от компании к компании, а то, что модель пишет каждый раз
+заново, она каждый раз пишет чуть иначе (DECISIONS.md, Р-053).
 
 Промпт собирается из двух частей:
-  * config/prompts/letter.md — оффер, первый шаг, запреты, тон. Общее для всех.
+  * config/prompts/letter.md — бриф на вставки: что в них должно быть;
   * config/prompts/angles/<тип>.md — угол под тип компании.
 
-Разделение не косметическое. Запреты и тон одинаковы всегда, а разговор с
-продуктовой компанией и с аутсорсером идёт о разном: у первой ICP острый и
-ей интересно ловить покупателя по событию, у второй боль в предсказуемости
-потока. Один текст на обоих превращается в рассылку — см. DECISIONS.md, Р-021.
+Разделение не косметическое: запреты и язык одинаковы всегда, а разговор
+с продуктовой компанией и с аутсорсером идёт о разном (Р-021).
 
-Письмо не отправляется. Оно попадает в утренний список, где вы его читаете,
-правите и отправляете руками.
+Письмо не отправляется. Оно попадает в утренний список и в панель, где вы
+его читаете, правите и отправляете руками.
 
-Письмо, не набравшее минимума фактов из досье (compose.min_facts в icp.yaml),
-в утренний список не идёт вовсе — см. DECISIONS.md, Р-024.
+Два порога отсева, оба до похода к модели:
+  * `compose.min_score` — рейтинг схождения сигналов (Р-054);
+  * `compose.min_facts` — сколько фактов из досье должно попасть в текст (Р-024).
 """
 
 from __future__ import annotations
 
 import json
 import re
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,17 +39,40 @@ logger = log.get("compose")
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "config" / "prompts"
 
+# ЧТО ОТДАЁТ МОДЕЛЬ. Не письмо, а две вставки в него. Само письмо лежит
+# в config/prompts/template.md и не меняется от компании к компании
+# (DECISIONS.md, Р-053).
 LETTER_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "subject": {"type": "string"},
-        "body": {"type": "string"},
+        "question": {"type": "string"},
+        "signs": {"type": "string"},
         "why_line": {"type": "string"},
         "facts_used": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["subject", "body", "why_line", "facts_used"],
+    "required": ["subject", "question", "signs", "why_line", "facts_used"],
     "additionalProperties": False,
 }
+
+# У дожима вставка одна: новая мысль. Просьба и подпись тоже в шаблоне.
+FOLLOWUP_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "subject": {"type": "string"},
+        "thought": {"type": "string"},
+        "why_line": {"type": "string"},
+        "facts_used": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["subject", "thought", "why_line", "facts_used"],
+    "additionalProperties": False,
+}
+
+# Потолок ответа. Раньше стояло 2048 под письмо целиком, и ответы в него
+# упирались: обрыв выглядел как «модель вернула не-JSON», а токены были
+# потрачены (DECISIONS.md, Р-052). Вставки короче письма впятеро, но запас
+# оставлен — он ничего не стоит, пока не понадобился.
+ANSWER_TOKENS = 1500
 
 
 def load_prompt(relative: str) -> str:
@@ -50,42 +83,30 @@ def load_prompt(relative: str) -> str:
 
 
 def build_system_prompt(site_type: str) -> str:
-    """Собирает промпт из трёх частей: бриф, оффер, угол под тип компании.
+    """Собирает промпт из двух частей: бриф на вставки и угол под тип компании.
 
-    Разделение по частоте изменений, а не по красоте. Бриф (кто пишет, кому,
-    что считается хорошей работой) устойчив. Оффер переписывается каждый раз,
-    когда вы поймёте, на что люди отвечают, — и правится отдельно, не задевая
-    остального. Угол объясняет, чем разговор с продуктовой компанией
-    отличается от разговора с аутсорсером (DECISIONS.md, Р-021).
+    Оффера здесь больше нет. Раньше он был отдельным файлом, который модель
+    читала, чтобы пересказать своими словами. Теперь предложение — это
+    фиксированный абзац шаблона, и пересказывать его незачем: модель его
+    даже не видит (DECISIONS.md, Р-053).
     """
     base = load_prompt("letter.md")
-    offer = load_prompt("offer.md")
-    angle_file = f"angles/{site_type}.md"
     try:
-        angle = load_prompt(angle_file)
+        angle = load_prompt(f"angles/{site_type}.md")
     except FileNotFoundError:
         angle = load_prompt("angles/default.md")
 
     return (
         base
-        + "\n\n---\n\n" + offer
-        + "\n\n---\n\n" + angle
+        + "\n\n---\n\n# Угол под эту компанию\n\n" + angle
         + "\n\n---\n\n## Формат ответа\n\n"
-        "Верни JSON: `subject` — тема письма; `body` — текст письма; "
-        "`why_line` — одна строка для утреннего списка, объясняющая, почему "
-        "эта компания здесь; `facts_used` — список фактов из досье, на "
-        "которые ты реально сослался в письме.\n\n"
-        "`facts_used` — не украшение, а самопроверка. Перечисляй только то, "
-        "что действительно попало в текст письма, дословно или близко. "
-        "Общие слова вроде «IT-компания» фактом не считаются. Письмо, "
-        "не опирающееся хотя бы на два факта из досье, человеку не "
-        "показывается: лучше не написать письма вовсе, чем написать такое, "
-        "которое подошло бы кому угодно.\n\n"
-        "`why_line` — одна короткая строка для внутреннего списка, не длиннее "
-        "120 знаков. По ней Михаил за секунду решает, читать ли письмо целиком, "
-        "поэтому это не пересказ письма и не досье: одна причина, почему "
-        "компания здесь. Выручку и численность тут называть можно — "
-        "в самом письме нельзя."
+        "Верни JSON с четырьмя полями: `subject`, `question`, `signs`, "
+        "`why_line`, плюс `facts_used`.\n\n"
+        "`facts_used` — самопроверка: перечисляй только те факты из досье, "
+        "на которые ты действительно опёрся в `question` и `signs`. Общие "
+        "слова вроде «IT-компания» фактом не считаются. Письмо, не опирающееся "
+        "хотя бы на два факта, человеку не показывается — лучше не написать "
+        "вовсе, чем написать подходящее кому угодно."
     )
 
 
@@ -134,15 +155,23 @@ _ACRONYM_RE = re.compile(r"\b[A-ZА-ЯЁ]{2,}\b")
 ACRONYM_ALLOWED = {"P.S.", "PS", "SMS"}
 
 
-def find_jargon(text: str, company: str = "") -> list[str]:
+def find_jargon(text: str, company: str = "", known: str = "") -> list[str]:
     """Сокращения и профессиональные слова в тексте письма.
 
     `company` — название компании-адресата: его сокращения разрешены,
     иначе письмо в PROMT ругалось бы на слово PROMT.
+
+    `known` — досье компании. Сокращение, которое есть в досье, — это
+    название продукта или системы, взятое с их сайта: «РЕД ОС», «САРУС»,
+    «1С». Такие слова законны.
+
+    Обратное тоже верно и полезно: сокращение, которого в досье нет,
+    модель откуда-то взяла сама. Либо это жаргон, либо выдуманное название —
+    и то и другое надо увидеть.
     """
     allowed = set(ACRONYM_ALLOWED)
-    for token in _ACRONYM_RE.findall((company or "").upper()):
-        allowed.add(token)
+    for source in (company or "", known or ""):
+        allowed.update(_ACRONYM_RE.findall(source.upper()))
 
     found: list[str] = []
     for token in _ACRONYM_RE.findall(text):
@@ -156,13 +185,25 @@ def find_jargon(text: str, company: str = "") -> list[str]:
     return found
 
 
-def load_origin() -> str:
-    """Концовка письма: откуда оно и подпись. Дословно из конфига.
+# День недели для разговора и через сколько дней его предлагать.
+#
+# Пятница — не случайный выбор: письмо уходит в начале недели, и к пятнице
+# у человека уже понятно, что за неделя. Три дня форы — чтобы предложенная
+# дата не оказалась «завтра», на которое никто не соглашается.
+CALL_WEEKDAY = 4          # 0 — понедельник, 4 — пятница
+CALL_LEAD_DAYS = 3
+WEEKDAY_NAMES = ["понедельник", "вторник", "среду", "четверг",
+                 "пятницу", "субботу", "воскресенье"]
 
-    Комментарии в начале файла (HTML-вида) выбрасываются — они для человека,
-    а не для письма.
-    """
-    text = load_prompt("origin.md")
+# Что модель обязана заполнить в шаблоне и что заполняет код.
+MODEL_SLOTS = ("вопрос", "признаки")
+CODE_SLOTS = ("день", "дата")
+
+_SLOT_RE = re.compile(r"\{([а-яё_]+)\}")
+
+
+def strip_comments(text: str) -> str:
+    """Убирает пояснения для человека — они не должны попасть в письмо."""
     while "<!--" in text and "-->" in text:
         head, _, rest = text.partition("<!--")
         _, _, tail = rest.partition("-->")
@@ -170,83 +211,117 @@ def load_origin() -> str:
     return text.strip()
 
 
-def finish_letter(body: str, origin: str, company: str = "",
-                  short: bool = False) -> tuple[str, list[str]]:
-    """Дописывает концовку и проверяет письмо механически.
+def load_template(name: str = "template.md") -> str:
+    """Шаблон письма без пояснений. Всё, что в нём, попадает в письмо дословно."""
+    return strip_comments(load_prompt(name))
 
-    Всё, что здесь проверяется, — не про вкус, а про соблюдение прямых
-    запретов. Просить модель об этом бесполезно: подпись она теряла три
-    прогона подряд, а описание системы сочиняла каждый раз заново.
-    Возвращает готовый текст и список замечаний для человека.
 
-    `short=True` — для дожима. У него своя длина и три абзаца вместо пяти:
-    знакомиться заново не нужно, нужна одна новая мысль.
+def next_call_date(today: date | None = None,
+                   weekday: int = CALL_WEEKDAY,
+                   lead_days: int = CALL_LEAD_DAYS) -> tuple[str, str]:
+    """Ближайший подходящий день для разговора: («пятницу», «14.08.2026»).
+
+    Считает код, а не модель. Дату модель называть не должна вовсе: она
+    не знает сегодняшнего числа и однажды предложит встретиться в прошлом.
     """
-    min_words, max_words = (55, 140) if short else (95, 220)
-    min_paragraphs = 3 if short else 4
-    text = (body or "").strip()
+    day = (today or date.today()) + timedelta(days=lead_days)
+    while day.weekday() != weekday:
+        day += timedelta(days=1)
+    return WEEKDAY_NAMES[weekday], day.strftime("%d.%m.%Y")
+
+
+def render_letter(template: str, slots: dict[str, str],
+                  today: date | None = None) -> str:
+    """Подставляет вставки в шаблон. Дату и день недели добавляет сама."""
+    day_name, day_date = next_call_date(today)
+    filled = {**slots, "день": day_name, "дата": day_date}
+
+    def replace(match: re.Match[str]) -> str:
+        return filled.get(match.group(1), match.group(0))
+
+    return _SLOT_RE.sub(replace, template).strip()
+
+
+def check_template(template: str, required: tuple[str, ...] = MODEL_SLOTS) -> list[str]:
+    """Есть ли в шаблоне все места под вставки. Проверяется до похода к модели.
+
+    Иначе правка шаблона в панели, где случайно стёрли `{признаки}`, дала бы
+    пачку одинаковых писем без главного абзаца — и заметить это можно было бы
+    только глазами.
+    """
+    found = set(_SLOT_RE.findall(template))
+    missing = [f"{{{name}}}" for name in required if name not in found]
+    unknown = [f"{{{name}}}" for name in sorted(found)
+               if name not in required and name not in CODE_SLOTS]
+
+    problems = []
+    if missing:
+        problems.append("в шаблоне нет мест под вставки: " + ", ".join(missing))
+    if unknown:
+        problems.append("в шаблоне лишние места, их некому заполнить: "
+                        + ", ".join(unknown))
+    return problems
+
+
+def check_letter(text: str, company: str = "",
+                 inserts: tuple[str, ...] = (), known: str = "") -> list[str]:
+    """Механические проверки готового письма. Возвращает замечания человеку.
+
+    Проверяется не вкус, а прямые запреты. Большая часть письма теперь
+    фиксирована шаблоном, поэтому проверок стало меньше: следить нужно
+    за вставками и за тем, что шаблон заполнился целиком.
+
+    `inserts` — то, что написала модель. Если передано, сокращения ищутся
+    только там. Фиксированный текст шаблона писал человек, он его прочитал,
+    и названия вроде «РЕД ОС» или «MAX» в нём законны. Проверять шаблон
+    каждое утро заново — значит приучить себя пропускать замечания.
+    """
     notes: list[str] = []
 
-    # Модель нет-нет да и подпишется сама, вопреки запрету. Срезаем хвостовые
-    # строки с подписью и прощанием, иначе подпись окажется в письме дважды.
-    # Обрезать по последнему вопросу, как раньше, больше нельзя: письмо
-    # заканчивается просьбой, а она не обязана быть вопросом.
-    lines = text.splitlines()
-    while lines:
-        last = lines[-1].strip().rstrip(",.").lower()
-        if not last:
-            lines.pop()
-            continue
-        if last in SIGN_OFFS or (len(last) < 30 and last.startswith("с уважением")):
-            lines.pop()
-            continue
-        break
-    text = "\n".join(lines).strip()
+    left = _SLOT_RE.findall(text)
+    if left:
+        notes.append("в письме осталось незаполненное место: "
+                     + ", ".join(f"{{{name}}}" for name in left))
 
-    if not text.lower().startswith("здравствуйте"):
-        notes.append("письмо не начинается с приветствия")
-
-    # Восклицательный знак разрешён ровно один раз — в приветствии. Дальше
-    # по тексту он читается как напор, а напор в холодном письме не работает.
-    body_after_greeting = "\n\n".join(text.split("\n\n")[1:])
-    if "!" in body_after_greeting:
-        notes.append("восклицательный знак в тексте письма — он разрешён "
-                     "только в «Здравствуйте!»")
-
-    # СОКРАЩЕНИЯ. Главная проверка этого блока: письмо читает генеральный
-    # директор, а не специалист по продажам (DECISIONS.md, Р-048).
-    jargon = find_jargon(text, company)
+    # СОКРАЩЕНИЯ — главная проверка (DECISIONS.md, Р-048). Живёт в коде,
+    # потому что просить об этом модель бесполезно: соглашается и забывает.
+    jargon = find_jargon(" ".join(inserts) if inserts else text, company, known)
     if jargon:
-        notes.append("сокращения и жаргон — распишите словами: "
+        notes.append("сокращения и жаргон во вставках — распишите словами: "
                      + ", ".join(jargon[:6]))
 
-    # Длина. Письмо теперь объясняет, что делает система и по каким признакам
-    # ищет, — на это нужно место. Потолок держим: получатель сканирует.
-    words = len(text.split())
-    if words < min_words:
-        notes.append(f"письмо короткое ({words} слов) — вероятно, "
-                     f"не хватило места на признаки покупателя")
-    if words > max_words:
-        notes.append(f"письмо длинное ({words} слов при потолке {max_words}) — "
-                     f"первое лицо такое сканирует, а не читает")
+    # Восклицательный знак: в шаблоне он ровно один, в приветствии.
+    # Значит, любой лишний пришёл из вставки.
+    checked = " ".join(inserts) if inserts else "\n\n".join(text.split("\n\n")[1:])
+    if "!" in checked:
+        notes.append("восклицательный знак во вставке — он разрешён "
+                     "только в «Здравствуйте!»")
 
-    # Абзац длиннее четырёх строк на телефоне выглядит стеной, а с телефона
-    # эти письма и открывают чаще всего.
+    words = len(text.split())
+    if words > 260:
+        notes.append(f"письмо длинное ({words} слов) — скорее всего, "
+                     f"вставка признаков разрослась")
+
     longest = max((len(p.split()) for p in text.split("\n\n")), default=0)
-    if longest > 70:
+    if longest > 90:
         notes.append(f"самый длинный абзац — {longest} слов, разбейте его")
 
-    # Пять частей письма: приветствие, вопрос, что делает Михаил,
-    # что предлагает, просьба. Меньше четырёх абзацев — какая-то выпала.
-    paragraphs = [p for p in text.split("\n\n") if p.strip()]
-    if len(paragraphs) < min_paragraphs:
-        notes.append(f"абзацев {len(paragraphs)} — проверьте, что на месте "
-                     f"вопрос, рассказ о системе, предложение и просьба")
-    if "?" not in text and not short:
-        notes.append("в письме нет ни одного вопроса — первый абзац должен "
-                     "спрашивать про их работу")
+    return notes
 
-    return f"{text}\n\n{origin}", notes
+
+def clean_insert(value: str) -> str:
+    """Приводит вставку в порядок перед подстановкой в шаблон.
+
+    Модель нет-нет да и вернёт вставку с приветствием, кавычками по краям
+    или переводом строки внутри. В шаблоне это ломает вёрстку письма,
+    а править руками каждое утро никто не станет.
+    """
+    text = " ".join((value or "").split())
+    text = text.strip('"«»')
+    for prefix in ("Здравствуйте!", "Здравствуйте,", "Здравствуйте."):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+    return text
 
 
 def build_followup_prompt(site_type: str) -> str:
@@ -430,9 +505,25 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
     compose_cfg = config.get("compose", {})
     per_run = limit or int(compose_cfg.get("per_run", 20))
     min_facts = int(compose_cfg.get("min_facts", 2))
+    min_score = float(compose_cfg.get("min_score", 5.0))
 
     placeholders = ",".join("?" for _ in target_types)
     conn = db.connect()
+
+    # ПОРОГ РЕЙТИНГА. Письмо стоит запроса к самой дорогой модели, и тратить
+    # его на компанию, у которой не сошлось ни одного признака, незачем.
+    # Балл считает scoring.py по тому, что уже в базе, — сам по себе он
+    # бесплатный (DECISIONS.md, Р-054).
+    skipped = conn.execute(
+        f"""
+        SELECT COUNT(*) FROM companies
+        WHERE icp_status = 'passed' AND site_type IN ({placeholders})
+          AND letter_body IS NULL AND letter_status IS NULL
+          AND COALESCE(signal_score, 0) < ?
+        """,
+        (*target_types, min_score),
+    ).fetchone()[0]
+
     rows = conn.execute(
         f"""
         SELECT * FROM companies
@@ -440,30 +531,46 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
           AND site_type IN ({placeholders})
           AND letter_body IS NULL
           AND letter_status IS NULL
-        ORDER BY
-            CASE WHEN revenue_change_pct IS NULL THEN 1 ELSE 0 END,
-            revenue_change_pct
+          AND COALESCE(signal_score, 0) >= ?
+        ORDER BY COALESCE(signal_score, 0) DESC, name
         LIMIT ?
         """,
-        (*target_types, per_run),
+        (*target_types, min_score, per_run),
     ).fetchall()
 
+    if skipped:
+        logger.info("Пропущено по рейтингу ниже %.1f: %d компаний "
+                    "(порог — compose.min_score)", min_score, skipped)
+
     if not rows:
-        logger.info("Нет компаний, готовых к письму. "
-                    "Сначала: run.py --stage targets, затем --stage dossier")
+        logger.info("Нет компаний, готовых к письму. Либо их ещё не собрали "
+                    "(этапы «Найти компании» и «Обойти сайты»), либо ни одна "
+                    "не набрала рейтинг %.1f", min_score)
         conn.close()
-        return {"written": 0}
+        return {"written": 0, "skipped_by_score": skipped}
 
-    logger.info("Компаний к написанию письма: %d (модель %s)", len(rows), llm.MODEL_WRITE)
+    logger.info("Компаний к написанию письма: %d (модель %s, рейтинг от %.1f)",
+                len(rows), llm.MODEL_WRITE, min_score)
 
+    # Шаблон читается один раз на прогон и проверяется до похода к модели:
+    # сломанный шаблон дал бы пачку одинаково испорченных писем.
     try:
-        origin = load_origin()
+        template = load_template()
     except FileNotFoundError as exc:
         logger.error("%s", exc)
         conn.close()
         return {"written": 0}
 
-    counters = {"written": 0, "failed": 0, "thin": 0}
+    broken = check_template(template)
+    if broken:
+        for problem in broken:
+            logger.error("Шаблон письма: %s", problem)
+        logger.error("Письма не пишем: сначала почините шаблон "
+                     "(«Настройки» → «Шаблон письма»)")
+        conn.close()
+        return {"written": 0}
+
+    counters = {"written": 0, "failed": 0, "thin": 0, "skipped_by_score": skipped}
     for index, row in enumerate(rows, start=1):
         name = row["name"]
         log.progress(index, len(rows), name)
@@ -490,9 +597,10 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
             logger.error("%s", exc)
             break
 
+        dossier = build_dossier(row)
         try:
-            result = llm.classify(system_prompt, build_dossier(row), LETTER_SCHEMA,
-                                  max_tokens=2048, model=llm.MODEL_WRITE)
+            result = llm.classify(system_prompt, dossier, LETTER_SCHEMA,
+                                  max_tokens=ANSWER_TOKENS, model=llm.MODEL_WRITE)
         except llm.LLMUnavailable as exc:
             logger.error("%s", exc)
             break
@@ -502,11 +610,17 @@ def run(config: dict[str, Any], dry_run: bool = False, limit: int | None = None)
             continue
 
         subject = result.get("subject", "")
-        body, notes = finish_letter(body_text := result.get("body", ""), origin, name)
+        body = render_letter(template, {
+            "вопрос": clean_insert(result.get("question", "")),
+            "признаки": clean_insert(result.get("signs", "")).rstrip("."),
+        })
+        notes = check_letter(body, name, known=dossier, inserts=(
+            clean_insert(result.get("question", "")),
+            clean_insert(result.get("signs", "")),
+        ))
         if len(subject) > SUBJECT_MAX:
             notes.append(f"тема длинная ({len(subject)} знаков) — "
                          f"на телефоне обрежется, укоротите до {SUBJECT_MAX}")
-        del body_text
         for note in notes:
             logger.warning("  ↳ %s: %s", name, note)
 
@@ -605,9 +719,16 @@ def run_followups(config: dict[str, Any], dry_run: bool = False) -> dict[str, in
     logger.info("Компаний к дожиму: %d (модель %s)", len(rows), llm.MODEL_WRITE)
 
     try:
-        origin = load_origin()
+        template = load_template("template_followup.md")
     except FileNotFoundError as exc:
         logger.error("%s", exc)
+        conn.close()
+        return {"written": 0}
+
+    broken = check_template(template, required=("мысль",))
+    if broken:
+        for problem in broken:
+            logger.error("Шаблон дожима: %s", problem)
         conn.close()
         return {"written": 0}
 
@@ -624,11 +745,12 @@ def run_followups(config: dict[str, Any], dry_run: bool = False) -> dict[str, in
             logger.warning("— %s: нет текста прошлых писем, дожим пропущен", name)
             continue
 
+        followup_dossier = build_followup_dossier(row, previous)
         try:
             result = llm.classify(
                 build_followup_prompt(row["site_type"] or "default"),
-                build_followup_dossier(row, previous),
-                LETTER_SCHEMA, max_tokens=2048, model=llm.MODEL_WRITE,
+                followup_dossier,
+                FOLLOWUP_SCHEMA, max_tokens=ANSWER_TOKENS, model=llm.MODEL_WRITE,
             )
         except llm.LLMUnavailable as exc:
             logger.error("%s", exc)
@@ -638,7 +760,10 @@ def run_followups(config: dict[str, Any], dry_run: bool = False) -> dict[str, in
             logger.warning("— %s: дожим не написался (%s)", name, exc)
             continue
 
-        body, notes = finish_letter(result.get("body", ""), origin, name, short=True)
+        body = render_letter(template,
+                             {"мысль": clean_insert(result.get("thought", ""))})
+        notes = check_letter(body, name, known=followup_dossier,
+                             inserts=(clean_insert(result.get("thought", "")),))
         for note in notes:
             logger.warning("  ↳ %s: %s", name, note)
 

@@ -65,32 +65,32 @@ FILES: dict[str, dict[str, Any]] = {
         "about": "Слова, по которым вакансия считается сигналом, и стоп-слова. "
                  "Проверяется на конфликты между теми и другими.",
     },
-    "letter": {
-        "path": ROOT / "config" / "prompts" / "letter.md",
-        "title": "Правила письма",
-        "kind": "text",
-        "about": "Устройство письма из пяти частей, запреты, язык, длина. "
+    "template": {
+        "path": ROOT / "config" / "prompts" / "template.md",
+        "title": "Шаблон письма",
+        "kind": "template",
+        "about": "Само письмо. Всё, кроме мест в фигурных скобках, попадает "
+                 "к адресату дословно: предложение, просьба, подпись, телефон. "
                  "Самый важный файл системы.",
     },
-    "offer": {
-        "path": ROOT / "config" / "prompts" / "offer.md",
-        "title": "Что предлагаем",
+    "template_followup": {
+        "path": ROOT / "config" / "prompts" / "template_followup.md",
+        "title": "Шаблон дожима",
+        "kind": "template",
+        "about": "Второе и третье письмо. Модель заполняет только {мысль}.",
+    },
+    "letter": {
+        "path": ROOT / "config" / "prompts" / "letter.md",
+        "title": "Правила вставок",
         "kind": "text",
-        "about": "Что делает система, что обещаем и о чём просим. Правится "
-                 "чаще остальных — по мере того, как понятно, на что отвечают.",
+        "about": "Каким должен быть вопрос в первом абзаце и перечень "
+                 "признаков покупателя. Всё остальное письмо — в шаблоне.",
     },
     "followup": {
         "path": ROOT / "config" / "prompts" / "followup.md",
         "title": "Правила дожима",
         "kind": "text",
-        "about": "Второе и третье письмо: новая мысль, а не напоминание.",
-    },
-    "origin": {
-        "path": ROOT / "config" / "prompts" / "origin.md",
-        "title": "Подпись и контакты",
-        "kind": "text",
-        "about": "Подставляется в конец каждого письма дословно. Проверяйте "
-                 "опечатки в телефоне: их некому заметить.",
+        "about": "Какой должна быть новая мысль во втором и третьем письме.",
     },
     "angle_product": {
         "path": ROOT / "config" / "prompts" / "angles" / "product.md",
@@ -179,8 +179,16 @@ def validate(key: str, text: str) -> list[str]:
                 else:
                     logger.warning("Замечание к настройкам: %s", violation)
 
-    if key == "origin" and "михаил" not in text.lower():
-        problems.append("в подписи нет имени — письма уйдут без неё")
+    # Шаблон без места под вставку дал бы пачку одинаковых писем без главного
+    # абзаца, и заметить это можно было бы только глазами.
+    if entry["kind"] == "template":
+        from . import compose
+
+        required = ("мысль",) if key == "template_followup" else compose.MODEL_SLOTS
+        problems.extend(compose.check_template(compose.strip_comments(text),
+                                               required=required))
+        if "михаил" not in text.lower():
+            problems.append("в подписи нет имени — письма уйдут без неё")
 
     return problems
 
